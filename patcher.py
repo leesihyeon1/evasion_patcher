@@ -33,18 +33,20 @@ from detectors.sleep_detector import SleepDetector
 from detectors.vm_detector import VMDetector
 from detectors.userinput_detector import UserInputDetector
 from detectors.antidebug_detector import AntiDebugDetector
+from detectors.autoit_detector import AutoItDetector
 from patchers.apply import apply_patches
 from report import print_findings, print_patch_results, save_json_report
 
 console = Console()
 
-_ALL_CATEGORIES = ["sleep", "vm", "userinput", "antidebug"]
+_ALL_CATEGORIES = ["sleep", "vm", "userinput", "antidebug", "autoit"]
 
 _DETECTOR_MAP = {
     "sleep":     SleepDetector,
     "vm":        VMDetector,
     "userinput": UserInputDetector,
     "antidebug": AntiDebugDetector,
+    "autoit":    AutoItDetector,
 }
 
 
