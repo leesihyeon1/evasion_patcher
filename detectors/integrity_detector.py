@@ -23,8 +23,10 @@ from core.disasm import (
     find_call_sites,
     find_next_cond_jump,
     find_prev_cond_jump,
+    find_va_refs_in_code,
     nop_cond_jump,
     scan_ascii_pattern,
+    str_boundary_start,
 )
 from .base import BaseDetector, Finding, PatchAction
 
@@ -35,6 +37,10 @@ _ERROR_STRINGS: list[bytes] = [
     b"cracked",
     b"tampered",
     b"infected",
+    b"debugger has been found",
+    b"unload it from memory",
+    b"debugger is running",
+    b"detected a debugger",
 ]
 
 _CRYPT_APIS: list[str] = [
@@ -156,13 +162,20 @@ class IntegrityDetector(BaseDetector):
 
         for pattern in _ERROR_STRINGS:
             for sec_off, sec_rva, sec_va, sec_data in self.pe.get_all_sections():
-                for str_file_off in scan_ascii_pattern(sec_data, sec_off, pattern):
+                for match_file_off in scan_ascii_pattern(sec_data, sec_off, pattern):
+                    # 패턴이 문자열 중간을 가리킬 수 있으므로 실제 시작 역탐색
+                    local = match_file_off - sec_off
+                    actual_local = str_boundary_start(sec_data, local)
+                    str_file_off = sec_off + actual_local
                     str_rva = self.pe.offset_to_rva(str_file_off)
                     if str_rva is None:
                         continue
                     str_va = self.pe.image_base + str_rva
 
-                    for ref_off, ref_va in self._find_string_refs(str_va, code_sections):
+                    for ref_off, ref_va in find_va_refs_in_code(
+                        str_va, code_sections,
+                        self.pe.is_64bit, self.pe.image_base,
+                    ):
                         jump = find_prev_cond_jump(
                             self.cs, self.pe.data, ref_off, ref_va,
                         )
@@ -227,32 +240,3 @@ class IntegrityDetector(BaseDetector):
                     and ops[1].type == X86_OP_IMM and ops[1].imm == 0)
         return False
 
-    def _find_string_refs(
-        self,
-        str_va: int,
-        code_sections: list,
-    ) -> list[tuple[int, int]]:
-        """코드 섹션에서 str_va를 참조하는 명령어의 (file_off, instr_va) 목록."""
-        results: list[tuple[int, int]] = []
-        va_lo32 = struct.pack('<I', str_va & 0xFFFFFFFF)
-
-        for sec_off, sec_rva, sec_va, sec_data in code_sections:
-            n = len(sec_data)
-
-            if not self.pe.is_64bit:
-                # x86: push imm32 (0x68 <4-byte VA>)
-                for i in range(1, n - 4):
-                    if sec_data[i - 1] == 0x68 and sec_data[i:i + 4] == va_lo32:
-                        results.append((sec_off + i - 1,
-                                        self.pe.image_base + sec_rva + i - 1))
-            else:
-                # x64: LEA reg, [RIP+disp32]  —  Rex(1) + 0x8D + ModRM(RIP-rel) + disp32
-                for i in range(n - 6):
-                    if (0x40 <= sec_data[i] <= 0x4F
-                            and sec_data[i + 1] == 0x8D
-                            and (sec_data[i + 2] & 0xC7) == 0x05):
-                        instr_va = self.pe.image_base + sec_rva + i
-                        disp = struct.unpack_from('<i', sec_data, i + 3)[0]
-                        if instr_va + 7 + disp == str_va:
-                            results.append((sec_off + i, instr_va))
-        return results

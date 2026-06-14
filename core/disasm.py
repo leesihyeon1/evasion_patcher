@@ -250,6 +250,57 @@ def scan_two_byte_pattern(
     return results
 
 
+# ── 문자열 경계 역탐색 ───────────────────────────────────────────
+def str_boundary_start(data: bytes, offset: int, max_lookback: int = 256) -> int:
+    """
+    offset 위치에서 역방향으로 스캔하여 ASCII 문자열의 실제 시작 오프셋 반환.
+    null 바이트 또는 비ASCII 문자(< 0x20 or > 0x7E) 이전 위치를 반환.
+    """
+    i = offset - 1
+    limit = max(0, offset - max_lookback)
+    while i >= limit:
+        b = data[i]
+        if b == 0 or b < 0x20 or b > 0x7E:
+            return i + 1
+        i -= 1
+    return offset
+
+
+# ── 코드 섹션 내 VA 참조 탐색 (push/LEA) ──────────────────────────
+def find_va_refs_in_code(
+    str_va: int,
+    code_sections: list,
+    is_64bit: bool,
+    image_base: int,
+) -> list[tuple[int, int]]:
+    """
+    코드 섹션에서 str_va를 참조하는 push imm32(x86) 또는 LEA rip+disp32(x64)
+    명령어의 (file_offset, instr_va) 목록을 반환.
+    """
+    import struct as _s
+    results: list[tuple[int, int]] = []
+    va_lo32 = _s.pack('<I', str_va & 0xFFFFFFFF)
+
+    for sec_off, sec_rva, sec_va, sec_data in code_sections:
+        n = len(sec_data)
+        if not is_64bit:
+            # push imm32: 0x68 <4-byte LE VA>
+            for i in range(1, n - 4):
+                if sec_data[i - 1] == 0x68 and sec_data[i:i + 4] == va_lo32:
+                    results.append((sec_off + i - 1, image_base + sec_rva + i - 1))
+        else:
+            # LEA reg, [RIP+disp32]: Rex(0x40-0x4F) + 0x8D + ModRM(RIP-rel) + disp32
+            for i in range(n - 6):
+                if (0x40 <= sec_data[i] <= 0x4F
+                        and sec_data[i + 1] == 0x8D
+                        and (sec_data[i + 2] & 0xC7) == 0x05):
+                    instr_va = image_base + sec_rva + i
+                    disp = _s.unpack_from('<i', sec_data, i + 3)[0]
+                    if instr_va + 7 + disp == str_va:
+                        results.append((sec_off + i, instr_va))
+    return results
+
+
 # ── 문자열 패턴 스캔 (VM 아티팩트 탐지) ──────────────────────────
 def scan_ascii_pattern(
     sec_data: bytes,
