@@ -29,18 +29,20 @@ from rich.console import Console
 
 from core.pe_utils import PEFile
 from core.disasm import make_cs
+from core.dotnet_utils import is_dotnet
 from detectors.sleep_detector import SleepDetector
 from detectors.vm_detector import VMDetector
 from detectors.userinput_detector import UserInputDetector
 from detectors.antidebug_detector import AntiDebugDetector
 from detectors.autoit_detector import AutoItDetector
 from detectors.integrity_detector import IntegrityDetector
+from detectors.dotnet_detector import DotNetDetector
 from patchers.apply import apply_patches
 from report import print_findings, print_patch_results, save_json_report
 
 console = Console()
 
-_ALL_CATEGORIES = ["sleep", "vm", "userinput", "antidebug", "autoit", "integrity"]
+_ALL_CATEGORIES = ["sleep", "vm", "userinput", "antidebug", "autoit", "integrity", "dotnet"]
 
 _DETECTOR_MAP = {
     "sleep":     SleepDetector,
@@ -49,6 +51,7 @@ _DETECTOR_MAP = {
     "antidebug": AntiDebugDetector,
     "autoit":    AutoItDetector,
     "integrity": IntegrityDetector,
+    "dotnet":    DotNetDetector,
 }
 
 
@@ -117,7 +120,9 @@ def main() -> None:
         sys.exit(1)
 
     arch = "x64" if pe.is_64bit else "x86"
-    console.print(f"  아키텍처: {arch}  ImageBase: 0x{pe.image_base:08X}")
+    dotnet = is_dotnet(pe.data)
+    dotnet_tag = "  [.NET CLR 감지]" if dotnet else ""
+    console.print(f"  아키텍처: {arch}  ImageBase: 0x{pe.image_base:08X}{dotnet_tag}")
     cs = make_cs(pe.is_64bit)
     console.print()
 
