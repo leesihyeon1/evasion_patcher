@@ -98,6 +98,34 @@ class PEFile:
     def read_bytes(self, file_offset: int, size: int) -> bytes:
         return bytes(self.data[file_offset : file_offset + size])
 
+    def get_checksum_offset(self) -> int:
+        """PE OptionalHeader.CheckSum 필드 파일 오프셋."""
+        import struct as _s
+        e_lfanew = _s.unpack_from('<I', bytes(self.data), 0x3C)[0]
+        return e_lfanew + 4 + 20 + 64  # PE sig(4) + COFF(20) + OptHdr→CheckSum(64)
+
+    def compute_checksum(self) -> int:
+        """현재 self.data 기준 PE 체크섬 계산 (CheckSum 필드는 0으로 제외)."""
+        import struct as _s
+        chksum_off = self.get_checksum_offset()
+        buf = bytearray(self.data)
+        buf[chksum_off:chksum_off + 4] = b'\x00\x00\x00\x00'
+        if len(buf) % 2:
+            buf.append(0)
+        checksum = 0
+        for i in range(0, len(buf), 2):
+            word = buf[i] | (buf[i + 1] << 8)
+            checksum += word
+            checksum = (checksum & 0xFFFF) + (checksum >> 16)
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+        return (checksum & 0xFFFF) + len(self.data)
+
+    def update_checksum(self) -> None:
+        """패치된 self.data 기준으로 PE 체크섬 재계산 후 헤더에 기록."""
+        import struct as _s
+        chksum_off = self.get_checksum_offset()
+        _s.pack_into('<I', self.data, chksum_off, self.compute_checksum())
+
     def patch_bytes(self, file_offset: int, new_bytes: bytes) -> None:
         end = file_offset + len(new_bytes)
         self.data[file_offset:end] = new_bytes

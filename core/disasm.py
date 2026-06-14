@@ -116,6 +116,30 @@ def find_call_sites(
 
 
 # ── 콜사이트 이후 조건부 점프 탐색 ───────────────────────────────
+def find_prev_cond_jump(
+    cs: Cs,
+    pe_data: bytearray,
+    from_file_offset: int,
+    from_va: int,
+    max_bytes: int = 256,
+) -> tuple[int, int, bytes] | None:
+    """
+    from_file_offset 이전 max_bytes 범위에서 가장 가까운 조건부 점프를 반환.
+    정방향 디스어셈블 후 마지막 Jcc 반환.
+    """
+    start = max(0, from_file_offset - max_bytes)
+    chunk = bytes(pe_data[start: from_file_offset])
+    chunk_va = from_va - (from_file_offset - start)
+
+    last_jcc: tuple[int, int, bytes] | None = None
+    for insn in cs.disasm(chunk, chunk_va):
+        m = insn.mnemonic
+        if m.startswith("j") and m != "jmp":
+            offset_in_chunk = insn.address - chunk_va
+            last_jcc = (start + offset_in_chunk, insn.address, bytes(insn.bytes))
+    return last_jcc
+
+
 def find_next_cond_jump(
     cs: Cs,
     pe_data: bytearray,

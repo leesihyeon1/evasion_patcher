@@ -34,12 +34,13 @@ from detectors.vm_detector import VMDetector
 from detectors.userinput_detector import UserInputDetector
 from detectors.antidebug_detector import AntiDebugDetector
 from detectors.autoit_detector import AutoItDetector
+from detectors.integrity_detector import IntegrityDetector
 from patchers.apply import apply_patches
 from report import print_findings, print_patch_results, save_json_report
 
 console = Console()
 
-_ALL_CATEGORIES = ["sleep", "vm", "userinput", "antidebug", "autoit"]
+_ALL_CATEGORIES = ["sleep", "vm", "userinput", "antidebug", "autoit", "integrity"]
 
 _DETECTOR_MAP = {
     "sleep":     SleepDetector,
@@ -47,6 +48,7 @@ _DETECTOR_MAP = {
     "userinput": UserInputDetector,
     "antidebug": AntiDebugDetector,
     "autoit":    AutoItDetector,
+    "integrity": IntegrityDetector,
 }
 
 
@@ -150,6 +152,8 @@ def main() -> None:
     # ── 저장 ─────────────────────────────────────────────────────
     if not args.dry_run and patchable:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        pe.update_checksum()
+        console.print(f"  [+] PE 체크섬 재계산 완료 (0x{pe.compute_checksum():08X})")
         pe.save(str(output_path))
 
     if not args.no_report:
