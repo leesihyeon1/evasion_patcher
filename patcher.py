@@ -29,7 +29,10 @@ from rich.console import Console
 
 from core.pe_utils import PEFile
 from core.disasm import make_cs
-from core.dotnet_utils import is_dotnet
+from core.dotnet_utils import (
+    is_dotnet, _find_metadata_streams, _parse_member_ref_tokens,
+    find_us_string_tokens, find_ldstr_refs, find_call_sites_il,
+)
 from detectors.sleep_detector import SleepDetector
 from detectors.vm_detector import VMDetector
 from detectors.userinput_detector import UserInputDetector
@@ -53,6 +56,90 @@ _DETECTOR_MAP = {
     "integrity": IntegrityDetector,
     "dotnet":    DotNetDetector,
 }
+
+
+_DOTNET_DIAG_TARGETS = [
+    ("MessageBox",  "Show"),
+    ("MessageBox",  "ShowDialog"),
+    ("Environment", "Exit"),
+    ("Application", "Exit"),
+]
+_DOTNET_DIAG_STRINGS = [
+    "File corrupted", "manipulated", "cracked",
+    "debugger has been found", "unload it from memory",
+    "windbg.exe", "x64dbg.exe",
+]
+
+
+def _print_dotnet_diag(pe_data: bytearray) -> None:
+    """dotnet 0건 시 자동 진단 — 탐지 실패 원인 출력."""
+    import struct as _s
+    console.rule("[dim].NET 진단[/dim]")
+
+    streams = _find_metadata_streams(pe_data)
+    if not streams:
+        console.print("  [red]메타데이터 스트림 파싱 실패[/red]")
+        return
+
+    console.print(f"  스트림: {list(streams.keys())}")
+
+    # ── #US 힙 문자열 탐색 ─────────────────────────────────────
+    us_result = streams.get('#US')
+    if us_result:
+        _, us_data = us_result
+        console.print(f"  #US 힙: {len(us_data)}B")
+        for s in _DOTNET_DIAG_STRINGS:
+            toks = find_us_string_tokens(us_data, s)
+            if toks:
+                for tok in toks:
+                    refs = find_ldstr_refs(pe_data, tok)
+                    console.print(
+                        f"  [green]#US '{s}' 토큰={hex(tok)}  "
+                        f"ldstr참조={[hex(r) for r in refs]}[/green]"
+                    )
+            else:
+                console.print(f"  [dim]#US '{s}' → 없음[/dim]")
+    else:
+        console.print("  [dim]#US 힙 없음[/dim]")
+
+    # ── #Strings / MemberRef 탐색 ─────────────────────────────
+    tilde   = streams.get('#~',       (0, b''))[1]
+    strings = streams.get('#Strings', (0, b''))[1]
+    if not tilde:
+        console.print("  [red]#~ 스트림 없음[/red]")
+        return
+
+    heap_sizes = tilde[6]
+    console.print(
+        f"  #~ HeapSizes=0x{heap_sizes:02X}  "
+        f"Strings={'4B' if heap_sizes&1 else '2B'}  "
+        f"GUID={'4B' if heap_sizes&2 else '2B'}  "
+        f"Blob={'4B' if heap_sizes&4 else '2B'}"
+    )
+
+    # #Strings 직접 탐색
+    for name in [b"MessageBox", b"Environment", b"Application", b"Show", b"Exit"]:
+        idx = strings.find(name + b'\x00')
+        status = f"@ 0x{idx:X}" if idx >= 0 else "없음"
+        color = "green" if idx >= 0 else "dim"
+        console.print(f"  [dim]#Strings '{name.decode()}':[/dim] [{color}]{status}[/{color}]")
+
+    # MemberRef 파싱
+    try:
+        results = _parse_member_ref_tokens(tilde, strings, _DOTNET_DIAG_TARGETS)
+        if results:
+            for tok, name in results:
+                sites = find_call_sites_il(pe_data, tok)
+                console.print(
+                    f"  [green]MemberRef {name} 토큰=0x{tok:08X}  "
+                    f"call사이트={[hex(c) for c in sites]}[/green]"
+                )
+        else:
+            console.print("  [yellow]MemberRef: MessageBox/Environment 참조 없음[/yellow]")
+    except Exception as e:
+        console.print(f"  [red]MemberRef 파싱 오류: {e}[/red]")
+
+    console.print()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -140,7 +227,13 @@ def main() -> None:
         else:
             console.print(f"  [dim]{cat:<10}   0건[/dim]")
         findings.extend(found)
-    console.print()
+
+    # dotnet 카테고리 실행 후 0건이면 원인 진단 자동 출력
+    if "dotnet" in args.categories and dotnet:
+        if not any(f.category == "dotnet" for f in findings):
+            _print_dotnet_diag(pe.data)
+    else:
+        console.print()
 
     print_findings(findings, str(input_path))
 
