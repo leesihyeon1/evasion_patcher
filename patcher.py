@@ -90,17 +90,19 @@ def main() -> None:
         sys.exit(1)
 
     # ── 출력 경로 결정 ─────────────────────────────────────────────
+    report_dir = input_path.parent / "REPORT"
     output_path = Path(args.output) if args.output else (
-        input_path.parent / (input_path.stem + "_patched" + input_path.suffix)
+        report_dir / (input_path.stem + "_patched" + input_path.suffix)
     )
     report_path = Path(args.report) if args.report else (
-        input_path.parent / (input_path.stem + "_report.json")
+        report_dir / (input_path.stem + "_report.json")
     )
 
     console.rule(f"[bold white]🔬 evasion_patcher — {input_path.name}")
     console.print(f"  대상  : {input_path}")
     if not args.dry_run:
         console.print(f"  출력  : {output_path}")
+    console.print(f"  보고서: {report_path}")
     console.print(f"  카테고리: {args.categories}")
     console.print()
 
@@ -147,9 +149,11 @@ def main() -> None:
 
     # ── 저장 ─────────────────────────────────────────────────────
     if not args.dry_run and patchable:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         pe.save(str(output_path))
 
     if not args.no_report:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         save_json_report(
             str(input_path),
             findings,
