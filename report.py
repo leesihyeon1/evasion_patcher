@@ -25,12 +25,18 @@ _CATEGORY_ICON = {
     "vm":         "🖥 ",
     "userinput":  "🖱 ",
     "antidebug":  "🔍",
+    "autoit":     "🤖",
+    "integrity":  "🔒",
+    "dotnet":     "🟣",
 }
 _CATEGORY_COLOR = {
     "sleep":      "yellow",
     "vm":         "cyan",
     "userinput":  "green",
     "antidebug":  "magenta",
+    "autoit":     "bright_yellow",
+    "integrity":  "bright_red",
+    "dotnet":     "bright_magenta",
 }
 
 
@@ -47,8 +53,10 @@ def print_findings(findings: list[Finding], target: str) -> None:
     )
     console.print()
 
-    # 카테고리별 그룹 출력
-    categories = ["sleep", "vm", "userinput", "antidebug"]
+    # 탐지된 카테고리를 순서대로 출력 (등록 순서 유지)
+    _ORDER = ["sleep", "vm", "userinput", "antidebug", "autoit", "integrity", "dotnet"]
+    present = {f.category for f in findings}
+    categories = [c for c in _ORDER if c in present] + sorted(present - set(_ORDER))
     for cat in categories:
         group = [f for f in findings if f.category == cat]
         if not group:

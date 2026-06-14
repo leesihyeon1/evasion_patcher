@@ -133,7 +133,12 @@ def main() -> None:
         cls = _DETECTOR_MAP[cat]
         det = cls(pe, cs)
         found = det.detect()
-        console.print(f"  {cat:<10} {len(found):3d}건 탐지")
+        if found:
+            console.print(f"  [green]{cat:<10} {len(found):3d}건 탐지[/green]")
+        elif cat == "dotnet" and not dotnet:
+            console.print(f"  [dim]{cat:<10}   0건 (CLR 헤더 없음 — 스킵)[/dim]")
+        else:
+            console.print(f"  [dim]{cat:<10}   0건[/dim]")
         findings.extend(found)
     console.print()
 
