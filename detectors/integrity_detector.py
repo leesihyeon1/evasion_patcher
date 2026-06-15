@@ -26,7 +26,9 @@ from core.disasm import (
     find_va_refs_in_code,
     nop_cond_jump,
     scan_ascii_pattern,
+    scan_wide_pattern,
     str_boundary_start,
+    str_boundary_start_wide,
 )
 from .base import BaseDetector, Finding, PatchAction
 
@@ -162,10 +164,22 @@ class IntegrityDetector(BaseDetector):
 
         for pattern in _ERROR_STRINGS:
             for sec_off, sec_rva, sec_va, sec_data in self.pe.get_all_sections():
-                for match_file_off in scan_ascii_pattern(sec_data, sec_off, pattern):
-                    # 패턴이 문자열 중간을 가리킬 수 있으므로 실제 시작 역탐색
+                # ASCII 스캔
+                ascii_hits = [
+                    (off, False)
+                    for off in scan_ascii_pattern(sec_data, sec_off, pattern)
+                ]
+                # UTF-16LE 스캔 (C++/CLI 혼합 모드 와이드 문자열)
+                wide_hits = [
+                    (off, True)
+                    for off in scan_wide_pattern(sec_data, sec_off, pattern)
+                ]
+                for match_file_off, is_wide in ascii_hits + wide_hits:
                     local = match_file_off - sec_off
-                    actual_local = str_boundary_start(sec_data, local)
+                    if is_wide:
+                        actual_local = str_boundary_start_wide(sec_data, local)
+                    else:
+                        actual_local = str_boundary_start(sec_data, local)
                     str_file_off = sec_off + actual_local
                     str_rva = self.pe.offset_to_rva(str_file_off)
                     if str_rva is None:
@@ -181,9 +195,10 @@ class IntegrityDetector(BaseDetector):
                         )
                         if jump and jump[0] in seen_jcc_offsets:
                             continue
+                        enc = "UTF-16LE" if is_wide else "ASCII"
                         actions, desc = self._jcc_patch(
                             jump,
-                            f"'{pattern.decode()}' 오류 문자열 참조 이전 분기",
+                            f"'{pattern.decode()}' ({enc}) 오류 문자열 참조 이전 분기",
                         )
                         if jump:
                             seen_jcc_offsets.add(jump[0])
@@ -193,7 +208,7 @@ class IntegrityDetector(BaseDetector):
                             va=ref_va,
                             file_offset=ref_off,
                             description=(
-                                f"'{pattern.decode()}' 문자열 참조 "
+                                f"'{pattern.decode()}'[{enc}] 문자열 참조 "
                                 f"@ 0x{ref_va:08X} {desc}"
                             ),
                             patch_actions=actions,

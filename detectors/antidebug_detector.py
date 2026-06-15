@@ -20,7 +20,9 @@ from __future__ import annotations
 
 from core.disasm import (
     find_call_sites, find_next_cond_jump, find_prev_cond_jump,
-    find_va_refs_in_code, nop_cond_jump, scan_ascii_pattern, str_boundary_start,
+    find_va_refs_in_code, nop_cond_jump,
+    scan_ascii_pattern, scan_wide_pattern,
+    str_boundary_start, str_boundary_start_wide,
 )
 from .base import BaseDetector, Finding, PatchAction
 
@@ -178,9 +180,11 @@ class AntiDebugDetector(BaseDetector):
 
         for tool_name in _DEBUGGER_TOOL_NAMES:
             for sec_off, sec_rva, sec_va, sec_data in self.pe.get_all_sections():
-                for match_file_off in scan_ascii_pattern(sec_data, sec_off, tool_name):
+                ascii_hits = [(off, False) for off in scan_ascii_pattern(sec_data, sec_off, tool_name)]
+                wide_hits  = [(off, True)  for off in scan_wide_pattern(sec_data, sec_off, tool_name)]
+                for match_file_off, is_wide in ascii_hits + wide_hits:
                     local = match_file_off - sec_off
-                    actual_local = str_boundary_start(sec_data, local)
+                    actual_local = (str_boundary_start_wide if is_wide else str_boundary_start)(sec_data, local)
                     str_file_off = sec_off + actual_local
                     str_rva = self.pe.offset_to_rva(str_file_off)
                     if str_rva is None:

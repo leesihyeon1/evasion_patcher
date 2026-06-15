@@ -320,3 +320,55 @@ def scan_ascii_pattern(
         results.append(sec_file_offset + idx)
         start = idx + 1
     return results
+
+
+def scan_wide_pattern(
+    sec_data: bytes,
+    sec_file_offset: int,
+    pattern: bytes,   # lowercase ASCII bytes
+) -> list[int]:
+    """
+    섹션 내 UTF-16LE 문자열 패턴(대소문자 무시) 파일 오프셋 목록 반환.
+    C++/CLI 혼합 모드 바이너리의 네이티브 데이터 섹션에 저장된
+    와이드 문자열(MessageBoxW 인자 등) 탐지용.
+    """
+    pat_lower = bytes(b | 0x20 if 0x41 <= b <= 0x5A else b for b in pattern)
+    plen = len(pat_lower)
+    n = len(sec_data)
+    results: list[int] = []
+    i = 0
+    while i <= n - plen * 2:
+        match = True
+        for j in range(plen):
+            hi = sec_data[i + j * 2]
+            lo = sec_data[i + j * 2 + 1]
+            if lo != 0:          # 고바이트(BMP 아닌 문자) → 불일치
+                match = False
+                break
+            c = hi | 0x20 if 0x41 <= hi <= 0x5A else hi
+            if c != pat_lower[j]:
+                match = False
+                break
+        if match:
+            results.append(sec_file_offset + i)
+        i += 1
+    return results
+
+
+def str_boundary_start_wide(data: bytes, offset: int, max_lookback: int = 512) -> int:
+    """
+    UTF-16LE 문자열에서 offset 위치의 실제 시작 오프셋을 역방향으로 탐색.
+    2바이트 단위로 역탐색하며 null 와이드 문자(\x00\x00) 또는
+    비ASCII 와이드 문자 직후를 반환.
+    """
+    i = (offset - 2) & ~1   # 2바이트 정렬 후 1문자 뒤로
+    limit = max(0, offset - max_lookback) & ~1
+    while i >= limit:
+        if i + 1 >= len(data):
+            break
+        lo = data[i + 1]   # UTF-16LE 고바이트
+        hi = data[i]       # UTF-16LE 저바이트 (코드포인트)
+        if lo != 0 or hi == 0 or hi < 0x20 or hi > 0x7E:
+            return i + 2   # 다음 위치가 문자열 시작
+        i -= 2
+    return offset
