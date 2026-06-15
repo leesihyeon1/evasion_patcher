@@ -11,6 +11,7 @@
 - #~ 테이블 파싱 → MemberRef 토큰 조회 (MessageBox.Show / Environment.Exit 등)
 - ldstr / call IL 명령어 탐색
 - IL 조건 분기(brfalse/brtrue 등) 역방향 탐색
+- .NET 내장 리소스(.resources) 파싱 → 문자열 키·값 추출
 """
 from __future__ import annotations
 
@@ -438,3 +439,154 @@ def find_prev_il_branch(
         else:
             i += 1
     return last
+
+
+# ── .NET 내장 리소스(.resources) 파싱 ────────────────────────────
+
+def _read_7bit_int(data: bytes | bytearray, pos: int) -> tuple[int, int]:
+    """
+    BinaryReader.Read7BitEncodedInt() 포맷 정수 읽기.
+    Returns (value, new_pos)
+    """
+    result = shift = 0
+    while pos < len(data):
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+        if shift > 35:
+            break
+    return result, pos
+
+
+def _parse_resources_blob(blob: bytes) -> list[tuple[str, str]]:
+    """
+    .NET .resources 바이너리 포맷에서 String 타입 리소스를 파싱.
+
+    포맷 (ResourceReader v1 / ECMA-335 §II.24.2.6 계열):
+        [0]  magic = 0xBEEFCACE  (4 bytes LE)
+        [4]  header_version = 1   (4 bytes)
+        [8]  skip = N             (4 bytes) — reader type string 길이
+        [12] [N bytes] reader type string
+        [12+N] resource set version (4)
+        [16+N] numResources (4)
+        [20+N] numTypes (4)
+        [type name strings (7-bit len + ASCII 각 numTypes 개)]
+        [pad to 8-byte boundary from offset 0]
+        [numResources * 4] hash codes
+        [numResources * 4] name offsets (relative to name section start)
+        [4] data_section_offset (absolute from blob start = offset 0)
+        [name section start]
+          for each resource: 7-bit byte_count + UTF-16LE name + int32 val_offset
+        [data section at data_section_offset]
+          for each resource: 7-bit type_tag + value
+            ResourceTypeCode.String(1): 7-bit byte_count + UTF-8 bytes
+
+    Returns: [(key, value_str), ...]
+    """
+    if len(blob) < 12:
+        return []
+    if struct.unpack_from('<I', blob, 0)[0] != 0xBEEFCACE:
+        return []
+
+    skip = struct.unpack_from('<I', blob, 8)[0]
+    pos = 12 + skip
+
+    if pos + 12 > len(blob):
+        return []
+
+    pos += 4  # resource set version
+    num_res   = struct.unpack_from('<I', blob, pos)[0]; pos += 4
+    num_types = struct.unpack_from('<I', blob, pos)[0]; pos += 4
+
+    if num_res > 65536:
+        return []
+
+    # type name strings 건너뜀 (각 항목: 7-bit len + bytes)
+    for _ in range(num_types):
+        n, pos = _read_7bit_int(blob, pos)
+        pos += n
+        if pos > len(blob):
+            return []
+
+    # 8-byte boundary padding (pos 0 기준 절대 정렬)
+    if pos % 8:
+        pos += 8 - (pos % 8)
+
+    if pos + num_res * 8 + 4 > len(blob):
+        return []
+
+    # hash code array 건너뜀
+    pos += num_res * 4
+
+    # name offsets array
+    name_offsets = list(struct.unpack_from(f'<{num_res}I', blob, pos))
+    pos += num_res * 4
+
+    # data section offset (blob 시작 = 오프셋 0 기준 절대값)
+    data_sec = struct.unpack_from('<I', blob, pos)[0]; pos += 4
+    name_sec = pos
+
+    results: list[tuple[str, str]] = []
+    for noff in name_offsets:
+        try:
+            npos = name_sec + noff
+            if npos >= len(blob):
+                continue
+            # 이름: 7-bit 바이트 수 + UTF-16LE
+            nbytes, npos = _read_7bit_int(blob, npos)
+            if npos + nbytes > len(blob):
+                continue
+            key = blob[npos:npos + nbytes].decode('utf-16-le', errors='ignore')
+            npos += nbytes
+            # 값 오프셋: int32 (data section 내 상대 오프셋)
+            if npos + 4 > len(blob):
+                continue
+            vrel = struct.unpack_from('<i', blob, npos)[0]
+            vpos = data_sec + vrel
+            if vpos >= len(blob):
+                continue
+            # 타입 태그 (7-bit)
+            tag, vpos = _read_7bit_int(blob, vpos)
+            if tag == 1:  # ResourceTypeCode.String
+                # BinaryReader.ReadString: 7-bit byte count + UTF-8
+                slen, vpos = _read_7bit_int(blob, vpos)
+                if vpos + slen > len(blob):
+                    continue
+                value = blob[vpos:vpos + slen].decode('utf-8', errors='ignore')
+                results.append((key, value))
+        except Exception:
+            continue
+
+    return results
+
+
+def get_embedded_resource_strings(pe_data: bytearray) -> list[tuple[str, str]]:
+    """
+    PE 내에 임베디드된 .NET .resources 블롭을 스캔하여 모든 문자열 리소스 반환.
+
+    ManifestResource 테이블 파싱 대신 magic(0xBEEFCACE)으로 직접 탐색하므로
+    복잡한 테이블 오프셋 계산 없이 동작함.
+
+    Returns: [(key, value_str), ...]  — 중복 키 제거
+    """
+    MAGIC = struct.pack('<I', 0xBEEFCACE)
+    results: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    n = len(pe_data)
+    i = 0
+    while i <= n - 4:
+        if bytes(pe_data[i:i + 4]) == MAGIC:
+            try:
+                blob = bytes(pe_data[i: i + min(0x200000, n - i)])
+                for k, v in _parse_resources_blob(blob):
+                    if k not in seen_keys:
+                        seen_keys.add(k)
+                        results.append((k, v))
+            except Exception:
+                pass
+            i += 4
+        else:
+            i += 1
+    return results

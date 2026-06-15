@@ -24,6 +24,7 @@ from core.dotnet_utils import (
     find_call_sites_il,
     find_method_call_tokens,
     find_prev_il_branch,
+    get_embedded_resource_strings,
     _IL_NOP,
 )
 from .base import BaseDetector, Finding, PatchAction
@@ -66,6 +67,7 @@ class DotNetDetector(BaseDetector):
 
         findings.extend(self._detect_ldstr_strings(seen))
         findings.extend(self._detect_messagebox_calls(seen))
+        findings.extend(self._detect_resource_strings(seen))
 
         return findings
 
@@ -108,7 +110,7 @@ class DotNetDetector(BaseDetector):
                     ))
         return findings
 
-    # ── 2. MessageBox.Show / Environment.Exit 콜사이트 이전 IL 분기
+    # ── 2. MessageBox.Show / Environment.Exit 콜사이트 이전 IL 분기 ──
     def _detect_messagebox_calls(self, seen: set[int]) -> list[Finding]:
         """
         MemberRef 테이블에서 MessageBox.Show / Environment.Exit 토큰을 찾아
@@ -150,4 +152,91 @@ class DotNetDetector(BaseDetector):
                         description=f"[.NET IL] {display_name} 이전 조건 분기 NOP",
                     )],
                 ))
+        return findings
+
+    # ── 3. .NET 내장 리소스(.resx → .resources) 문자열 탐지 ─────────
+    def _detect_resource_strings(self, seen: set[int]) -> list[Finding]:
+        """
+        PE 내 0xBEEFCACE magic으로 .resources 블롭 탐색 →
+        오류/안티디버그 패턴과 일치하는 string 값 추출 →
+        해당 리소스 KEY가 #US 힙에 있으면 ldstr 경로를 추적해 IL 분기 NOP.
+        KEY가 IL에 없으면 정보성 Finding(패치 불가)으로 보고.
+        """
+        resource_pairs = get_embedded_resource_strings(self.pe.data)
+        if not resource_pairs:
+            return []
+
+        _PATTERNS: list[tuple[str, str]] = [
+            ("corrupt",             "IntegrityString"),
+            ("manipulat",          "IntegrityString"),
+            ("cracked",            "IntegrityString"),
+            ("tampered",           "IntegrityString"),
+            ("debugger has been",  "AntiDebugString"),
+            ("unload it",          "AntiDebugString"),
+            ("debugger is running","AntiDebugString"),
+            ("detected a debugger","AntiDebugString"),
+            ("windbg",             "ToolNameString"),
+            ("ollydbg",            "ToolNameString"),
+            ("x64dbg",             "ToolNameString"),
+            ("x32dbg",             "ToolNameString"),
+            ("processhacker",      "ToolNameString"),
+            ("cheatengine",        "ToolNameString"),
+        ]
+
+        us_result = get_us_heap(self.pe.data)
+        us_data = us_result[1] if us_result else b''
+
+        findings: list[Finding] = []
+        for key, value in resource_pairs:
+            vl = value.lower()
+            technique = next((t for p, t in _PATTERNS if p in vl), None)
+            if technique is None:
+                continue
+
+            # 리소스 KEY가 #US 힙에 있는 경우: ldstr → IL 분기 NOP
+            key_tokens = find_us_string_tokens(us_data, key) if us_data else []
+            patched = False
+            for token in key_tokens:
+                for ldstr_off in find_ldstr_refs(self.pe.data, token):
+                    branch = find_prev_il_branch(self.pe.data, ldstr_off)
+                    if branch is None:
+                        continue
+                    b_off, b_bytes = branch
+                    if b_off in seen:
+                        continue
+                    seen.add(b_off)
+                    patched = True
+                    nop_bytes = bytes([_IL_NOP] * len(b_bytes))
+                    findings.append(Finding(
+                        category="dotnet",
+                        technique=technique,
+                        va=ldstr_off,
+                        file_offset=b_off,
+                        description=(
+                            f"[.NET Resource] key='{key}' value='{value[:40]}'"
+                            f" → ldstr @ 0x{ldstr_off:X} IL Jcc @ 0x{b_off:X} NOP"
+                        ),
+                        patch_actions=[PatchAction(
+                            file_offset=b_off,
+                            original_bytes=b_bytes,
+                            new_bytes=nop_bytes,
+                            description=f"[.NET Resource] '{key}' 리소스 로드 분기 NOP",
+                        )],
+                    ))
+
+            if not patched:
+                # KEY가 IL에 없음(C++/CLI 혼합 모드 또는 직접 참조) → 정보성 보고
+                findings.append(Finding(
+                    category="dotnet",
+                    technique=technique,
+                    va=0,
+                    file_offset=0,
+                    description=(
+                        f"[.NET Resource] key='{key}' "
+                        f"value='{value[:60]}' "
+                        f"(#US 힙에 키 없음 — IL 분기 자동 패치 불가)"
+                    ),
+                    patch_actions=[],
+                ))
+
         return findings

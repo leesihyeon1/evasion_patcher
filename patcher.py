@@ -32,6 +32,7 @@ from core.disasm import make_cs
 from core.dotnet_utils import (
     is_dotnet, _find_metadata_streams, _parse_member_ref_tokens,
     find_us_string_tokens, find_ldstr_refs, find_call_sites_il,
+    get_embedded_resource_strings,
 )
 from detectors.sleep_detector import SleepDetector
 from detectors.vm_detector import VMDetector
@@ -138,6 +139,30 @@ def _print_dotnet_diag(pe_data: bytearray) -> None:
             console.print("  [yellow]MemberRef: MessageBox/Environment 참조 없음[/yellow]")
     except Exception as e:
         console.print(f"  [red]MemberRef 파싱 오류: {e}[/red]")
+
+    # ── 내장 리소스(.resources) 스캔 ──────────────────────────────
+    console.print()
+    console.print("  [dim]── 내장 리소스(.resources) 스캔 ──[/dim]")
+    try:
+        res_pairs = get_embedded_resource_strings(pe_data)
+        if res_pairs:
+            console.print(f"  [green]리소스 문자열 {len(res_pairs)}개 발견[/green]")
+            _ERROR_PAT = [
+                b"corrupt", b"manipulat", b"cracked", b"tampered",
+                b"debugger", b"windbg", b"ollydbg", b"x64dbg", b"x32dbg",
+                b"processhacker", b"cheatengine",
+            ]
+            for k, v in res_pairs:
+                vl = v.lower().encode('utf-8', errors='ignore')
+                is_hit = any(p in vl for p in _ERROR_PAT)
+                if is_hit:
+                    console.print(f"  [yellow]  [탐지] key='{k}'  value='{v[:60]}'[/yellow]")
+                else:
+                    console.print(f"  [dim]  key='{k}'  value='{v[:60]}'[/dim]")
+        else:
+            console.print("  [dim]내장 리소스 없음 또는 0xBEEFCACE magic 미발견[/dim]")
+    except Exception as e:
+        console.print(f"  [red]리소스 스캔 오류: {e}[/red]")
 
     console.print()
 
