@@ -341,4 +341,203 @@ if (NtQueryInformationProcess) {
     });
 });
 
-log('INIT', '샌드박스 회피 무력화 훅 로드 완료');
+// ─────────────────────────────────────────────────────────────────
+// 스레드 숨김 (ThreadHideFromDebugger 무력화)
+// ─────────────────────────────────────────────────────────────────
+const NtSetInformationThread = Module.findExportByName('ntdll.dll', 'NtSetInformationThread');
+if (NtSetInformationThread) {
+    const ThreadHideFromDebugger = 17;
+    Interceptor.attach(NtSetInformationThread, {
+        onEnter(args) {
+            if (args[1].toUInt32() === ThreadHideFromDebugger) {
+                log('AntiDebug', 'NtSetInformationThread(ThreadHideFromDebugger) → 무력화');
+                this._nop = true;
+            }
+        },
+        onLeave(retval) {
+            if (this._nop) retval.replace(ptr(0));  // STATUS_SUCCESS (no-op)
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 타이밍 — QueryPerformanceCounter / QueryPerformanceFrequency
+// RDTSC는 static patcher 가 NOP 처리, 여기서는 QPC 계열 커버
+// ─────────────────────────────────────────────────────────────────
+let _qpcCounter = 1000000;
+
+const QueryPerformanceCounter = Module.findExportByName('kernel32.dll', 'QueryPerformanceCounter');
+if (QueryPerformanceCounter) {
+    Interceptor.attach(QueryPerformanceCounter, {
+        onEnter(args) { this._pCount = args[0]; },
+        onLeave(retval) {
+            _qpcCounter += 10000;   // 10µs씩 증가 (정상 PC처럼)
+            try {
+                if (this._pCount && !this._pCount.isNull())
+                    this._pCount.writeS64(_qpcCounter);
+            } catch (_) {}
+            retval.replace(ptr(1));
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 프로세스 목록 숨기기 — 분석 툴 프로세스 이름 위장
+// Process32NextW/A 에서 분석 툴 이름을 "explorer.exe"로 교체
+// ─────────────────────────────────────────────────────────────────
+const ANALYSIS_TOOLS = [
+    'x64dbg', 'x32dbg', 'ollydbg', 'windbg', 'ida64', 'ida.exe',
+    'procmon', 'procexp', 'wireshark', 'fiddler', 'processhacker',
+    'immunitydebugger', 'cheatengine', 'dnspy', 'de4dot', 'pestudio',
+    'hollows_hunter', 'pe-sieve', 'pebear', 'lordpe', 'cffexplorer',
+    'apimonitor', 'regshot', 'autoruns',
+];
+
+// PROCESSENTRY32W.szExeFile 오프셋
+// x86: DWORD*5 + ULONG_PTR(4) + LONG + DWORD = 36
+// x64: DWORD*5 + ULONG_PTR(8) + LONG + DWORD = 40
+const _szExeOffset = Process.pointerSize === 8 ? 44 : 36;
+
+['Process32NextW', 'Process32NextA', 'Process32FirstW', 'Process32FirstA'].forEach(api => {
+    const fn = Module.findExportByName('kernel32.dll', api);
+    if (!fn) return;
+    const isWide = api.endsWith('W');
+    Interceptor.attach(fn, {
+        onEnter(args) { this._pEntry = args[1]; },
+        onLeave(retval) {
+            if (!retval.toUInt32() || !this._pEntry) return;
+            try {
+                const namePtr = this._pEntry.add(_szExeOffset);
+                const exeName = isWide
+                    ? namePtr.readUtf16String()
+                    : namePtr.readAnsiString();
+                if (!exeName) return;
+                const lower = exeName.toLowerCase();
+                if (ANALYSIS_TOOLS.some(t => lower.includes(t))) {
+                    log('ProcHide', `${api}: "${exeName}" → "explorer.exe" 위장`);
+                    if (isWide) namePtr.writeUtf16String('explorer.exe');
+                    else        namePtr.writeAnsiString('explorer.exe');
+                    // PID도 탐색기 PID(4)로 교체해 일관성 유지
+                    this._pEntry.add(8).writeU32(4);
+                }
+            } catch (_) {}
+        }
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 오류 대화상자 차단 + 조기 종료 방지
+// Joe Sandbox의 핵심: 바이너리 무수정 → 자체 해시 통과
+// 여기서는 다이얼로그 자체를 막고 ExitProcess 를 무력화
+// ─────────────────────────────────────────────────────────────────
+
+// MessageBoxA/W — 오류 메시지 표시 차단
+['MessageBoxA', 'MessageBoxW', 'MessageBoxExA', 'MessageBoxExW'].forEach(api => {
+    const fn = Module.findExportByName('user32.dll', api);
+    if (!fn) return;
+    const isWide = api.includes('W');
+    Interceptor.replace(fn, new NativeCallback(function(hWnd, lpText, lpCaption, uType) {
+        try {
+            const text = lpText && !ptr(lpText).isNull()
+                ? (isWide ? ptr(lpText).readUtf16String() : ptr(lpText).readAnsiString())
+                : '';
+            const cap  = lpCaption && !ptr(lpCaption).isNull()
+                ? (isWide ? ptr(lpCaption).readUtf16String() : ptr(lpCaption).readAnsiString())
+                : '';
+            log('MsgBlock', `${api} 차단 — [${cap}] ${text}`);
+        } catch (_) {}
+        return 1;  // IDOK — 다이얼로그 없이 즉시 확인 반환
+    }, 'int', ['pointer', 'pointer', 'pointer', 'uint']));
+});
+
+// TaskDialog / TaskDialogIndirect — 현대 오류 다이얼로그
+const TaskDialog = Module.findExportByName('comctl32.dll', 'TaskDialog');
+if (TaskDialog) {
+    Interceptor.replace(TaskDialog, new NativeCallback(
+        function(hwnd, hInst, title, content, btn) {
+            log('MsgBlock', 'TaskDialog 차단');
+            return 0;  // S_OK
+        }, 'int', ['pointer', 'pointer', 'pointer', 'pointer', 'uint']
+    ));
+}
+
+// ExitProcess — 프로세스 강제 종료 차단
+const ExitProcess = Module.findExportByName('kernel32.dll', 'ExitProcess');
+if (ExitProcess) {
+    Interceptor.replace(ExitProcess, new NativeCallback(function(exitCode) {
+        log('AntiKill', `ExitProcess(${exitCode}) 차단 — 프로세스 계속 실행`);
+        // 실제로 종료하지 않음
+    }, 'void', ['uint']));
+}
+
+// TerminateProcess — 타 프로세스 종료 시도도 차단 (자기 자신 대상만)
+const TerminateProcess = Module.findExportByName('kernel32.dll', 'TerminateProcess');
+if (TerminateProcess) {
+    Interceptor.attach(TerminateProcess, {
+        onEnter(args) {
+            // GetCurrentProcess() = 0xFFFFFFFF (-1) = 자기 자신
+            const handle = args[0].toUInt32();
+            if (handle === 0xFFFFFFFF || handle === Process.id) {
+                log('AntiKill', `TerminateProcess(self, ${args[1].toUInt32()}) 차단`);
+                this._blockSelf = true;
+            }
+        },
+        onLeave(retval) {
+            if (this._blockSelf) retval.replace(ptr(1));  // TRUE (성공인 척)
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 자체 무결성 검사 모니터링 (CryptHash / BCryptHash)
+// 패치한 바이너리가 해시 불일치를 일으키는지 탐지 목적
+// ─────────────────────────────────────────────────────────────────
+['CryptHashData', 'CryptGetHashParam'].forEach(api => {
+    const fn = Module.findExportByName('advapi32.dll', api);
+    if (!fn) return;
+    Interceptor.attach(fn, {
+        onEnter(args) {
+            if (api === 'CryptHashData') {
+                log('Integrity', `CryptHashData: ${args[2].toUInt32()} bytes 해싱`);
+            } else {
+                log('Integrity', `CryptGetHashParam: param=${args[1].toUInt32()}`);
+            }
+        }
+    });
+});
+
+const BCryptHashData = Module.findExportByName('bcrypt.dll', 'BCryptHashData');
+if (BCryptHashData) {
+    Interceptor.attach(BCryptHashData, {
+        onEnter(args) {
+            log('Integrity', `BCryptHashData: ${args[2].toUInt32()} bytes 해싱`);
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// GetProcAddress 모니터링 — 동적 API 로딩 탐지
+// ─────────────────────────────────────────────────────────────────
+const _GP_WATCH = [
+    'IsDebuggerPresent', 'CheckRemoteDebuggerPresent',
+    'NtQueryInformationProcess', 'MessageBoxW', 'MessageBoxA',
+    'ExitProcess', 'GetModuleFileNameW',
+];
+const GetProcAddress = Module.findExportByName('kernel32.dll', 'GetProcAddress');
+if (GetProcAddress) {
+    Interceptor.attach(GetProcAddress, {
+        onEnter(args) {
+            try {
+                // 서수(ordinal) 로딩은 args[1]이 정수 — 문자열 읽기 전 확인
+                const ordinal = args[1].toUInt32();
+                if (ordinal < 0x10000) return;
+                const name = args[1].readAnsiString() || '';
+                if (_GP_WATCH.some(w => name.includes(w))) {
+                    log('DynImport', `GetProcAddress("${name}") 동적 로딩 탐지`);
+                }
+            } catch (_) {}
+        }
+    });
+}
+
+log('INIT', '샌드박스 회피 무력화 훅 로드 완료 (Joe Sandbox 동등 모드)');
