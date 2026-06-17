@@ -34,6 +34,9 @@ from core.dotnet_utils import (
     find_us_string_tokens, find_ldstr_refs, find_call_sites_il,
     get_embedded_resource_strings,
 )
+from core.disasm import (
+    scan_wide_pattern, find_call_sites, find_prev_cond_jump, find_va_refs_in_code,
+)
 from detectors.sleep_detector import SleepDetector
 from detectors.vm_detector import VMDetector
 from detectors.userinput_detector import UserInputDetector
@@ -72,9 +75,10 @@ _DOTNET_DIAG_STRINGS = [
 ]
 
 
-def _print_dotnet_diag(pe_data: bytearray) -> None:
+def _print_dotnet_diag(pe, cs) -> None:
     """dotnet 0건 시 자동 진단 — 탐지 실패 원인 출력."""
     import struct as _s
+    pe_data = pe.data
     console.rule("[dim].NET 진단[/dim]")
 
     streams = _find_metadata_streams(pe_data)
@@ -163,6 +167,79 @@ def _print_dotnet_diag(pe_data: bytearray) -> None:
             console.print("  [dim]내장 리소스 없음 또는 0xBEEFCACE magic 미발견[/dim]")
     except Exception as e:
         console.print(f"  [red]리소스 스캔 오류: {e}[/red]")
+
+    # ── UTF-16LE 전체 스캔 ────────────────────────────────────────
+    console.print()
+    console.print("  [dim]── 전체 섹션 UTF-16LE 스캔 ──[/dim]")
+    _WIDE_TARGETS = [
+        b"corrupt", b"manipulat", b"debugger has been",
+        b"unload it", b"file corrupted", b"cracked",
+    ]
+    code_sections = pe.get_code_sections()
+    try:
+        for sec_off, sec_rva, sec_va, sec_data in pe.get_all_sections():
+            sec_name_bytes = b''
+            for s in pe.pe.sections:
+                if s.PointerToRawData == sec_off:
+                    sec_name_bytes = s.Name.rstrip(b'\x00')
+                    break
+            sec_name = sec_name_bytes.decode('ascii', errors='replace')
+            for pat in _WIDE_TARGETS:
+                hits = scan_wide_pattern(sec_data, sec_off, pat)
+                for hit_off in hits:
+                    hit_rva = hit_off - sec_off + sec_rva
+                    hit_va  = pe.image_base + hit_rva
+                    refs = find_va_refs_in_code(
+                        hit_va, code_sections, pe.is_64bit, pe.image_base
+                    )
+                    ref_str = [f"0x{r[1]:X}" for r in refs]
+                    color = "green" if refs else "yellow"
+                    console.print(
+                        f"  [{color}]UTF-16LE '{pat.decode()}' @ "
+                        f"파일=0x{hit_off:X}  VA=0x{hit_va:X}  섹션={sec_name}  "
+                        f"VA참조={ref_str if ref_str else '없음'}[/{color}]"
+                    )
+    except Exception as e:
+        console.print(f"  [red]UTF-16LE 스캔 오류: {e}[/red]")
+
+    # ── user32.dll IAT 임포트 및 MessageBox 콜사이트 ──────────────
+    console.print()
+    console.print("  [dim]── user32.dll IAT / MessageBox 콜사이트 ──[/dim]")
+    try:
+        imports = pe.get_imports()
+        u32 = imports.get("user32.dll", {})
+        if not u32:
+            console.print("  [yellow]user32.dll 임포트 없음[/yellow]")
+        else:
+            console.print(f"  user32.dll 임포트: {list(u32.keys())[:20]}")
+        for api in ("MessageBoxA", "MessageBoxW", "MessageBoxExA", "MessageBoxExW"):
+            iat_va = u32.get(api)
+            if iat_va is None:
+                console.print(f"  [dim]{api}: IAT 없음[/dim]")
+                continue
+            sites = []
+            for sec_off, sec_rva, sec_va, sec_data in code_sections:
+                sites += find_call_sites(
+                    sec_data, sec_off, sec_rva,
+                    iat_va, pe.is_64bit, pe.image_base,
+                )
+            console.print(
+                f"  [green]{api} IAT=0x{iat_va:X}  "
+                f"콜사이트({len(sites)}): "
+                f"{[f'0x{c[1]:X}' for c in sites[:8]]}[/green]"
+            )
+            for call_off, call_va in sites[:8]:
+                jump = find_prev_cond_jump(cs, pe.data, call_off, call_va, max_bytes=512)
+                if jump:
+                    j_off, j_va, j_bytes = jump
+                    console.print(
+                        f"    [yellow]← Jcc @ 0x{j_va:X} "
+                        f"({j_bytes.hex()}) offset=0x{j_off:X}[/yellow]"
+                    )
+                else:
+                    console.print(f"    [dim]← 이전 Jcc 없음 (512B 이내)[/dim]")
+    except Exception as e:
+        console.print(f"  [red]IAT 분석 오류: {e}[/red]")
 
     console.print()
 
@@ -256,7 +333,7 @@ def main() -> None:
     # dotnet 카테고리 실행 후 0건이면 원인 진단 자동 출력
     if "dotnet" in args.categories and dotnet:
         if not any(f.category == "dotnet" for f in findings):
-            _print_dotnet_diag(pe.data)
+            _print_dotnet_diag(pe, cs)
     else:
         console.print()
 

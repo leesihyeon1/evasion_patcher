@@ -56,6 +56,20 @@ _MODULE_APIS: list[str] = [
     "GetModuleHandleW",
 ]
 
+# 오류 대화상자 API — C++/CLI 혼합 모드에서 IAT 경유 네이티브 호출 패턴
+_DIALOG_APIS: dict[str, list[str]] = {
+    "user32.dll": [
+        "MessageBoxA",
+        "MessageBoxW",
+        "MessageBoxExA",
+        "MessageBoxExW",
+    ],
+    "comctl32.dll": [
+        "TaskDialog",
+        "TaskDialogIndirect",
+    ],
+}
+
 
 class IntegrityDetector(BaseDetector):
     CATEGORY = "integrity"
@@ -66,6 +80,7 @@ class IntegrityDetector(BaseDetector):
         findings.extend(self._detect_getmodulehandle())
         findings.extend(self._detect_crypt_hash())
         findings.extend(self._detect_error_strings())
+        findings.extend(self._detect_messagebox_dialogs())
         return findings
 
     # ── 1. PE 체크섬 불일치 ────────────────────────────────────────
@@ -213,6 +228,57 @@ class IntegrityDetector(BaseDetector):
                             ),
                             patch_actions=actions,
                         ))
+        return findings
+
+    # ── 5. MessageBox / TaskDialog 오류 대화상자 이전 Jcc ──────────
+    def _detect_messagebox_dialogs(self) -> list[Finding]:
+        """
+        MessageBoxA/W · TaskDialog IAT 호출 이전 조건부 점프 NOP.
+
+        C++/CLI 혼합 모드 바이너리에서 무결성 검사 실패 시 오류 팝업을
+        native call 경로로 표시하는 패턴.  _detect_error_strings 의
+        문자열 VA 참조 방식이 실패할 때(push <VA> 패턴 없음, LoadStringW
+        경유, 동적 문자열 조합 등) 보조 탐지 경로로 활성화됨.
+
+        call MessageBoxW 이전 최대 512 바이트에서 가장 가까운 Jcc를 NOP.
+        """
+        findings: list[Finding] = []
+        imports = self.pe.get_imports()
+        seen_jcc_offsets: set[int] = set()
+
+        for dll, apis in _DIALOG_APIS.items():
+            dll_imports = imports.get(dll, {})
+            for api in apis:
+                iat_va = dll_imports.get(api)
+                if iat_va is None:
+                    continue
+                for sec_off, sec_rva, sec_va, sec_data in self.pe.get_code_sections():
+                    for call_off, call_va in find_call_sites(
+                        sec_data, sec_off, sec_rva,
+                        iat_va, self.pe.is_64bit, self.pe.image_base,
+                    ):
+                        jump = find_prev_cond_jump(
+                            self.cs, self.pe.data,
+                            call_off, call_va,
+                            max_bytes=512,
+                        )
+                        if jump is None:
+                            continue
+                        if jump[0] in seen_jcc_offsets:
+                            continue
+                        seen_jcc_offsets.add(jump[0])
+                        actions, desc = self._jcc_patch(
+                            jump, f"{api} 오류 대화상자 이전 분기"
+                        )
+                        findings.append(Finding(
+                            category="integrity",
+                            technique=f"MessageBox_{api}",
+                            va=call_va,
+                            file_offset=call_off,
+                            description=f"{api} @ 0x{call_va:08X} {desc}",
+                            patch_actions=actions,
+                        ))
+
         return findings
 
     # ── 내부 헬퍼 ─────────────────────────────────────────────────
