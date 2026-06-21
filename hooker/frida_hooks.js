@@ -1,543 +1,493 @@
 /**
- * frida_hooks.js
- * 샌드박스 회피 기법 런타임 무력화 (Frida 인젝션용)
+ * frida_hooks.js — 샌드박스/안티분석 회피 무력화
  *
- * 커버 범위
- * ---------
- * [Sleep]      Sleep / SleepEx / NtDelayExecution / timeGetTime / GetTickCount
- * [VM]         RegOpenKeyEx / RegQueryValueEx / CreateFile / GetModuleHandle
- * [UserInput]  GetCursorPos / GetAsyncKeyState / GetSystemMetrics / GetLastInputInfo
- * [AntiDebug]  IsDebuggerPresent / CheckRemoteDebuggerPresent / NtQueryInformationProcess
- *              FindWindow / OutputDebugString
- *
- * 사용법
- * ------
- * frida -l frida_hooks.js -f target.exe --no-pause
- * frida -l frida_hooks.js --pid 1234
+ * 주의: 'use strict' 제거, Date.now() 미사용
+ *       NativeCallback 생성 오류가 전체 스크립트를 중단시키지 않도록
+ *       모든 섹션을 독립 try-catch 로 격리함.
  */
-
-'use strict';
 
 // ── 유틸 ─────────────────────────────────────────────────────────
 function log(tag, msg) {
     console.log('[' + tag + '] ' + msg);
 }
 
-// 커서 위치 시뮬레이션 (매 호출마다 조금씩 이동)
-let _cursorX = 640, _cursorY = 400;
-function fakeCursorMove() {
-    _cursorX = (_cursorX + 3) % 1920;
-    _cursorY = (_cursorY + 2) % 1080;
+log('INIT', 'frida_hooks.js 파싱 시작');
+
+// Win32 API calling convention
+var WIN_ABI = (Process.pointerSize === 4) ? 'stdcall' : 'default';
+log('INIT', 'WIN_ABI=' + WIN_ABI + ' pointerSize=' + Process.pointerSize);
+
+// ─────────────────────────────────────────────────────────────────
+// Frida 버전 호환 export 탐색
+// Frida <=15: Module.findExportByName(mod, name) → null on miss
+// Frida 16+:  Module.findExportByName 제거, getExportByName(mod, name) → throws on miss
+// ─────────────────────────────────────────────────────────────────
+log('DIAG', 'findExportByName=' + typeof Module.findExportByName +
+           ' getExportByName=' + typeof Module.getExportByName);
+
+var findExp = (function() {
+    if (typeof Module.getExportByName === 'function') {
+        log('DIAG', 'API: getExportByName 사용');
+        return function(mod, name) {
+            try {
+                var a = Module.getExportByName(mod, name);
+                return (a && !a.isNull()) ? a : null;
+            } catch (_) { return null; }
+        };
+    }
+    if (typeof Module.findExportByName === 'function') {
+        log('DIAG', 'API: findExportByName 사용');
+        return function(mod, name) {
+            try { return Module.findExportByName(mod, name); } catch (_) { return null; }
+        };
+    }
+    log('DIAG', 'API: export 탐색 불가 — 모든 훅 비활성');
+    return function() { return null; };
+}());
+
+// ─────────────────────────────────────────────────────────────────
+// 안전 훅 헬퍼
+// ─────────────────────────────────────────────────────────────────
+function safeAttach(label, addr, callbacks) {
+    if (!addr) { return; }
+    try {
+        Interceptor.attach(addr, callbacks);
+        log('HOOK', label + ' attached');
+    } catch (e) {
+        log('HOOK_ERR', label + ': ' + e.message);
+    }
 }
 
-// GetTickCount 카운터 (실제처럼 증가)
-let _tickCount = Date.now();
+function safeCb(label, retType, argTypes, impl) {
+    try {
+        return new NativeCallback(impl, retType, argTypes, WIN_ABI);
+    } catch (e) {
+        log('CB_ERR', label + ': ' + e.message);
+        return null;
+    }
+}
 
-// VM 관련 레지스트리 경로 패턴 (소문자)
-const VM_REG_PATTERNS = [
-    'vmware', 'virtualbox', 'vbox', 'qemu', 'cuckoo',
-    'sandboxie', 'virtual machine', 'triage',
-];
-function isVMRegPath(path) {
-    if (!path) return false;
-    const lower = path.toLowerCase();
-    return VM_REG_PATTERNS.some(p => lower.includes(p));
+function safeReplace(label, addr, cb) {
+    if (!addr || !cb) { return; }
+    try {
+        Interceptor.replace(addr, cb);
+        log('HOOK', label + ' replaced');
+    } catch (e) {
+        log('HOOK_ERR', label + ': ' + e.message);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
 // SLEEP 계열
 // ─────────────────────────────────────────────────────────────────
-const Sleep = Module.findExportByName('kernel32.dll', 'Sleep');
-if (Sleep) {
-    Interceptor.attach(Sleep, {
-        onEnter(args) {
-            const ms = args[0].toUInt32();
+try {
+    var _cursorX = 640, _cursorY = 400;
+    var _tickCount = 100000;   // Date.now() 대신 고정 시작값
+
+    safeAttach('Sleep', findExp('kernel32.dll', 'Sleep'), {
+        onEnter: function(args) {
+            var ms = args[0].toUInt32();
             if (ms > 100) {
-                log('Sleep', `Sleep(${ms}ms) → 1ms 로 단축`);
+                log('Sleep', 'Sleep(' + ms + 'ms) → 1ms');
                 args[0] = ptr(1);
             }
         }
     });
-}
 
-const SleepEx = Module.findExportByName('kernel32.dll', 'SleepEx');
-if (SleepEx) {
-    Interceptor.attach(SleepEx, {
-        onEnter(args) {
-            const ms = args[0].toUInt32();
+    safeAttach('SleepEx', findExp('kernel32.dll', 'SleepEx'), {
+        onEnter: function(args) {
+            var ms = args[0].toUInt32();
             if (ms > 100) {
-                log('Sleep', `SleepEx(${ms}ms) → 1ms 로 단축`);
+                log('Sleep', 'SleepEx(' + ms + 'ms) → 1ms');
                 args[0] = ptr(1);
             }
         }
     });
-}
 
-const NtDelayExecution = Module.findExportByName('ntdll.dll', 'NtDelayExecution');
-if (NtDelayExecution) {
-    Interceptor.attach(NtDelayExecution, {
-        onEnter(args) {
-            // args[1] = PLARGE_INTEGER pInterval (100ns 단위, 음수=상대시간)
+    safeAttach('NtDelayExecution', findExp('ntdll.dll', 'NtDelayExecution'), {
+        onEnter: function(args) {
             try {
-                const interval = args[1];
-                if (!interval.isNull()) {
-                    // 100ns 단위로 1ms = -10000 (상대값은 음수)
-                    interval.writeS64(-10000);
-                    log('Sleep', 'NtDelayExecution → 1ms 로 단축');
-                }
+                var interval = args[1];
+                if (!interval.isNull()) { interval.writeS64(-10000); }
             } catch (_) {}
         }
     });
-}
 
-const GetTickCount = Module.findExportByName('kernel32.dll', 'GetTickCount');
-if (GetTickCount) {
-    Interceptor.attach(GetTickCount, {
-        onLeave(retval) {
-            // 실제처럼 증가하는 값 반환 (sandox detection 우회)
+    safeAttach('GetTickCount', findExp('kernel32.dll', 'GetTickCount'), {
+        onLeave: function(retval) {
             _tickCount += 15;
-            retval.replace(_tickCount & 0xFFFFFFFF);
+            retval.replace(ptr(_tickCount & 0x7FFFFFFF));
         }
     });
-}
 
-const GetTickCount64 = Module.findExportByName('kernel32.dll', 'GetTickCount64');
-if (GetTickCount64) {
-    Interceptor.attach(GetTickCount64, {
-        onLeave(retval) {
+    safeAttach('GetTickCount64', findExp('kernel32.dll', 'GetTickCount64'), {
+        onLeave: function(retval) {
             _tickCount += 15;
             retval.replace(ptr(_tickCount));
         }
     });
-}
+} catch (e) { log('ERR', 'Sleep 섹션: ' + e.message); }
 
 // ─────────────────────────────────────────────────────────────────
 // VM / 환경 탐지
 // ─────────────────────────────────────────────────────────────────
-['RegOpenKeyExA', 'RegOpenKeyExW'].forEach(api => {
-    const fn = Module.findExportByName('advapi32.dll', api);
-    if (!fn) return;
-    Interceptor.attach(fn, {
-        onEnter(args) {
-            try {
-                const isWide = api.endsWith('W');
-                const keyPath = isWide
-                    ? args[1].readUtf16String()
-                    : args[1].readAnsiString();
-                if (isVMRegPath(keyPath)) {
-                    log('VM', `${api}("${keyPath}") → ERROR_FILE_NOT_FOUND 반환`);
-                    this._block = true;
-                }
-            } catch (_) {}
-        },
-        onLeave(retval) {
-            if (this._block) {
-                retval.replace(2);  // ERROR_FILE_NOT_FOUND
-            }
+try {
+    var VM_REG_PATTERNS = [
+        'vmware', 'virtualbox', 'vbox', 'qemu', 'cuckoo', 'sandboxie', 'triage',
+    ];
+    function isVMRegPath(path) {
+        if (!path) { return false; }
+        var lower = path.toLowerCase();
+        for (var i = 0; i < VM_REG_PATTERNS.length; i++) {
+            if (lower.indexOf(VM_REG_PATTERNS[i]) !== -1) { return true; }
         }
-    });
-});
+        return false;
+    }
 
-['RegQueryValueExA', 'RegQueryValueExW'].forEach(api => {
-    const fn = Module.findExportByName('advapi32.dll', api);
-    if (!fn) return;
-    Interceptor.attach(fn, {
-        onEnter(args) {
-            try {
-                const isWide = api.endsWith('W');
-                const valName = isWide
-                    ? args[1].readUtf16String()
-                    : args[1].readAnsiString();
-                if (isVMRegPath(valName || '')) {
-                    this._block = true;
-                }
-            } catch (_) {}
-        },
-        onLeave(retval) {
-            if (this._block) {
-                retval.replace(2);
-            }
-        }
-    });
-});
-
-['GetModuleHandleA', 'GetModuleHandleW'].forEach(api => {
-    const fn = Module.findExportByName('kernel32.dll', api);
-    if (!fn) return;
-    const VM_MODULES = ['vmtoolsd', 'vboxservice', 'vboxtray', 'vboxhook', 'sandboxie'];
-    Interceptor.attach(fn, {
-        onEnter(args) {
-            try {
-                const isWide = api.endsWith('W');
-                const name = (isWide
-                    ? args[0].readUtf16String()
-                    : args[0].readAnsiString()) || '';
-                if (VM_MODULES.some(m => name.toLowerCase().includes(m))) {
-                    log('VM', `${api}("${name}") → NULL 반환`);
-                    this._block = true;
-                }
-            } catch (_) {}
-        },
-        onLeave(retval) {
-            if (this._block) {
-                retval.replace(ptr(0));  // NULL = 모듈 없음
-            }
-        }
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────
-// 사용자 상호작용 체크
-// ─────────────────────────────────────────────────────────────────
-const GetCursorPos = Module.findExportByName('user32.dll', 'GetCursorPos');
-if (GetCursorPos) {
-    Interceptor.attach(GetCursorPos, {
-        onLeave(retval) {
-            // 정상 반환 후 POINT 구조체에 fake 값 주입
-            try {
-                fakeCursorMove();
-                const point = this.context.rcx || this.context.ecx;
-                if (point) {
-                    Memory.writeS32(ptr(point),        _cursorX);
-                    Memory.writeS32(ptr(point).add(4), _cursorY);
-                }
-            } catch (_) {}
-            retval.replace(1);  // TRUE
-        }
-    });
-}
-
-const GetAsyncKeyState = Module.findExportByName('user32.dll', 'GetAsyncKeyState');
-if (GetAsyncKeyState) {
-    Interceptor.attach(GetAsyncKeyState, {
-        onLeave(retval) {
-            // 0x8001 = 키가 눌려 있고 이전에도 눌렸음
-            retval.replace(0x8001);
-            log('UserInput', 'GetAsyncKeyState → 0x8001 (키 입력 시뮬레이션)');
-        }
-    });
-}
-
-const GetSystemMetrics = Module.findExportByName('user32.dll', 'GetSystemMetrics');
-if (GetSystemMetrics) {
-    const SM_CXSCREEN = 0, SM_CYSCREEN = 1;
-    Interceptor.attach(GetSystemMetrics, {
-        onEnter(args) { this._index = args[0].toUInt32(); },
-        onLeave(retval) {
-            if (this._index === SM_CXSCREEN) retval.replace(1920);
-            else if (this._index === SM_CYSCREEN) retval.replace(1080);
-        }
-    });
-}
-
-const GetLastInputInfo = Module.findExportByName('user32.dll', 'GetLastInputInfo');
-if (GetLastInputInfo) {
-    Interceptor.attach(GetLastInputInfo, {
-        onLeave(retval) {
-            // LASTINPUTINFO.dwTime = 현재 TickCount에 가까운 값 → "최근 입력"
-            try {
-                const pInfo = this.context.rcx || this.context.ecx;
-                if (pInfo) {
-                    // 구조체: UINT cbSize(4) + DWORD dwTime(4)
-                    Memory.writeU32(ptr(pInfo).add(4), (_tickCount - 100) & 0xFFFFFFFF);
-                }
-            } catch (_) {}
-            retval.replace(1);
-        }
-    });
-}
-
-// ─────────────────────────────────────────────────────────────────
-// 안티디버깅
-// ─────────────────────────────────────────────────────────────────
-const IsDebuggerPresent = Module.findExportByName('kernel32.dll', 'IsDebuggerPresent');
-if (IsDebuggerPresent) {
-    Interceptor.attach(IsDebuggerPresent, {
-        onLeave(retval) {
-            if (retval.toUInt32() !== 0) {
-                log('AntiDebug', 'IsDebuggerPresent → 0 으로 패치');
-                retval.replace(0);
-            }
-        }
-    });
-}
-
-const CheckRemoteDebuggerPresent = Module.findExportByName(
-    'kernel32.dll', 'CheckRemoteDebuggerPresent'
-);
-if (CheckRemoteDebuggerPresent) {
-    Interceptor.attach(CheckRemoteDebuggerPresent, {
-        onEnter(args) { this._pbDebugger = args[1]; },
-        onLeave(retval) {
-            try {
-                if (this._pbDebugger && !this._pbDebugger.isNull()) {
-                    Memory.writeU32(this._pbDebugger, 0);  // FALSE
-                }
-            } catch (_) {}
-            retval.replace(1);  // 함수 자체는 TRUE(성공) 반환
-        }
-    });
-}
-
-const NtQueryInformationProcess = Module.findExportByName(
-    'ntdll.dll', 'NtQueryInformationProcess'
-);
-if (NtQueryInformationProcess) {
-    const ProcessDebugPort  = 7;
-    const ProcessDebugFlags = 31;
-    const ProcessDebugObject= 30;
-    Interceptor.attach(NtQueryInformationProcess, {
-        onEnter(args) {
-            this._class  = args[1].toUInt32();
-            this._pInfo  = args[2];
-            this._infoSz = args[3].toUInt32();
-        },
-        onLeave(retval) {
-            if ([ProcessDebugPort, ProcessDebugFlags, ProcessDebugObject]
-                    .includes(this._class)) {
+    ['RegOpenKeyExA', 'RegOpenKeyExW'].forEach(function(api) {
+        var fn = findExp('advapi32.dll', api);
+        if (!fn) { return; }
+        var isWide = api.charAt(api.length - 1) === 'W';
+        safeAttach(api, fn, {
+            onEnter: function(args) {
                 try {
-                    if (this._pInfo && !this._pInfo.isNull() && this._infoSz >= 4) {
-                        Memory.writeU32(this._pInfo, 0);  // 디버거 없음
+                    var keyPath = isWide ? args[1].readUtf16String() : args[1].readAnsiString();
+                    if (isVMRegPath(keyPath)) {
+                        log('VM', api + '("' + keyPath + '") → BLOCKED');
+                        this._block = true;
                     }
                 } catch (_) {}
-                log('AntiDebug',
-                    `NtQueryInformationProcess(class=${this._class}) → 0`);
+            },
+            onLeave: function(retval) {
+                if (this._block) { retval.replace(ptr(2)); }  // ERROR_FILE_NOT_FOUND
             }
-        }
+        });
     });
-}
 
-['FindWindowA', 'FindWindowW'].forEach(api => {
-    const fn = Module.findExportByName('user32.dll', api);
-    if (!fn) return;
-    const DBG_WINDOWS = ['ollydbg', 'x64dbg', 'x32dbg', 'immunity debugger', 'windbg'];
-    Interceptor.attach(fn, {
-        onEnter(args) {
+    ['RegQueryValueExA', 'RegQueryValueExW'].forEach(function(api) {
+        var fn = findExp('advapi32.dll', api);
+        if (!fn) { return; }
+        var isWide = api.charAt(api.length - 1) === 'W';
+        safeAttach(api, fn, {
+            onEnter: function(args) {
+                try {
+                    var val = isWide ? args[1].readUtf16String() : args[1].readAnsiString();
+                    if (isVMRegPath(val || '')) { this._block = true; }
+                } catch (_) {}
+            },
+            onLeave: function(retval) {
+                if (this._block) { retval.replace(ptr(2)); }
+            }
+        });
+    });
+
+    var VM_MODULES = ['vmtoolsd', 'vboxservice', 'vboxtray', 'sandboxie'];
+    ['GetModuleHandleA', 'GetModuleHandleW'].forEach(function(api) {
+        var fn = findExp('kernel32.dll', api);
+        if (!fn) { return; }
+        var isWide = api.charAt(api.length - 1) === 'W';
+        safeAttach(api, fn, {
+            onEnter: function(args) {
+                try {
+                    var name = (isWide ? args[0].readUtf16String() : args[0].readAnsiString()) || '';
+                    var lower = name.toLowerCase();
+                    for (var i = 0; i < VM_MODULES.length; i++) {
+                        if (lower.indexOf(VM_MODULES[i]) !== -1) {
+                            log('VM', api + '("' + name + '") → NULL');
+                            this._block = true;
+                            break;
+                        }
+                    }
+                } catch (_) {}
+            },
+            onLeave: function(retval) {
+                if (this._block) { retval.replace(ptr(0)); }
+            }
+        });
+    });
+} catch (e) { log('ERR', 'VM 섹션: ' + e.message); }
+
+// ─────────────────────────────────────────────────────────────────
+// 사용자 상호작용
+// ─────────────────────────────────────────────────────────────────
+try {
+    safeAttach('GetCursorPos', findExp('user32.dll', 'GetCursorPos'), {
+        onLeave: function(retval) {
             try {
-                const isWide = api.endsWith('W');
-                const cls  = isWide ? args[0].readUtf16String() : args[0].readAnsiString();
-                const name = isWide ? args[1].readUtf16String() : args[1].readAnsiString();
-                const combined = ((cls || '') + (name || '')).toLowerCase();
-                if (DBG_WINDOWS.some(d => combined.includes(d))) {
-                    log('AntiDebug', `${api} 디버거 윈도우 탐색 → NULL`);
-                    this._block = true;
+                _cursorX = (_cursorX + 3) % 1920;
+                _cursorY = (_cursorY + 2) % 1080;
+                var eax = this.context.eax;
+                if (eax) {
+                    Memory.writeS32(ptr(eax),        _cursorX);
+                    Memory.writeS32(ptr(eax).add(4), _cursorY);
                 }
-            } catch (_) {}
-        },
-        onLeave(retval) {
-            if (this._block) retval.replace(ptr(0));
-        }
-    });
-});
-
-['OutputDebugStringA', 'OutputDebugStringW'].forEach(api => {
-    const fn = Module.findExportByName('kernel32.dll', api);
-    if (!fn) return;
-    Interceptor.attach(fn, {
-        onEnter(_args) {
-            // 타이밍 측정용 안티디버그 — 호출 자체는 허용, 단 로그만 기록
-            log('AntiDebug', `${api} 호출 감지`);
-        }
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────
-// 스레드 숨김 (ThreadHideFromDebugger 무력화)
-// ─────────────────────────────────────────────────────────────────
-const NtSetInformationThread = Module.findExportByName('ntdll.dll', 'NtSetInformationThread');
-if (NtSetInformationThread) {
-    const ThreadHideFromDebugger = 17;
-    Interceptor.attach(NtSetInformationThread, {
-        onEnter(args) {
-            if (args[1].toUInt32() === ThreadHideFromDebugger) {
-                log('AntiDebug', 'NtSetInformationThread(ThreadHideFromDebugger) → 무력화');
-                this._nop = true;
-            }
-        },
-        onLeave(retval) {
-            if (this._nop) retval.replace(ptr(0));  // STATUS_SUCCESS (no-op)
-        }
-    });
-}
-
-// ─────────────────────────────────────────────────────────────────
-// 타이밍 — QueryPerformanceCounter / QueryPerformanceFrequency
-// RDTSC는 static patcher 가 NOP 처리, 여기서는 QPC 계열 커버
-// ─────────────────────────────────────────────────────────────────
-let _qpcCounter = 1000000;
-
-const QueryPerformanceCounter = Module.findExportByName('kernel32.dll', 'QueryPerformanceCounter');
-if (QueryPerformanceCounter) {
-    Interceptor.attach(QueryPerformanceCounter, {
-        onEnter(args) { this._pCount = args[0]; },
-        onLeave(retval) {
-            _qpcCounter += 10000;   // 10µs씩 증가 (정상 PC처럼)
-            try {
-                if (this._pCount && !this._pCount.isNull())
-                    this._pCount.writeS64(_qpcCounter);
             } catch (_) {}
             retval.replace(ptr(1));
         }
     });
-}
 
-// ─────────────────────────────────────────────────────────────────
-// 프로세스 목록 숨기기 — 분석 툴 프로세스 이름 위장
-// Process32NextW/A 에서 분석 툴 이름을 "explorer.exe"로 교체
-// ─────────────────────────────────────────────────────────────────
-const ANALYSIS_TOOLS = [
-    'x64dbg', 'x32dbg', 'ollydbg', 'windbg', 'ida64', 'ida.exe',
-    'procmon', 'procexp', 'wireshark', 'fiddler', 'processhacker',
-    'immunitydebugger', 'cheatengine', 'dnspy', 'de4dot', 'pestudio',
-    'hollows_hunter', 'pe-sieve', 'pebear', 'lordpe', 'cffexplorer',
-    'apimonitor', 'regshot', 'autoruns',
-];
+    safeAttach('GetAsyncKeyState', findExp('user32.dll', 'GetAsyncKeyState'), {
+        onLeave: function(retval) { retval.replace(ptr(0x8001)); }
+    });
 
-// PROCESSENTRY32W.szExeFile 오프셋
-// x86: DWORD*5 + ULONG_PTR(4) + LONG + DWORD = 36
-// x64: DWORD*5 + ULONG_PTR(8) + LONG + DWORD = 40
-const _szExeOffset = Process.pointerSize === 8 ? 44 : 36;
-
-['Process32NextW', 'Process32NextA', 'Process32FirstW', 'Process32FirstA'].forEach(api => {
-    const fn = Module.findExportByName('kernel32.dll', api);
-    if (!fn) return;
-    const isWide = api.endsWith('W');
-    Interceptor.attach(fn, {
-        onEnter(args) { this._pEntry = args[1]; },
-        onLeave(retval) {
-            if (!retval.toUInt32() || !this._pEntry) return;
+    safeAttach('GetLastInputInfo', findExp('user32.dll', 'GetLastInputInfo'), {
+        onLeave: function(retval) {
             try {
-                const namePtr = this._pEntry.add(_szExeOffset);
-                const exeName = isWide
-                    ? namePtr.readUtf16String()
-                    : namePtr.readAnsiString();
-                if (!exeName) return;
-                const lower = exeName.toLowerCase();
-                if (ANALYSIS_TOOLS.some(t => lower.includes(t))) {
-                    log('ProcHide', `${api}: "${exeName}" → "explorer.exe" 위장`);
-                    if (isWide) namePtr.writeUtf16String('explorer.exe');
-                    else        namePtr.writeAnsiString('explorer.exe');
-                    // PID도 탐색기 PID(4)로 교체해 일관성 유지
-                    this._pEntry.add(8).writeU32(4);
-                }
+                var eax = this.context.eax;
+                if (eax) { Memory.writeU32(ptr(eax).add(4), (_tickCount - 100) & 0x7FFFFFFF); }
             } catch (_) {}
+            retval.replace(ptr(1));
         }
     });
-});
+} catch (e) { log('ERR', 'UserInput 섹션: ' + e.message); }
 
 // ─────────────────────────────────────────────────────────────────
-// 오류 대화상자 차단 + 조기 종료 방지
-// Joe Sandbox의 핵심: 바이너리 무수정 → 자체 해시 통과
-// 여기서는 다이얼로그 자체를 막고 ExitProcess 를 무력화
+// 안티디버깅
 // ─────────────────────────────────────────────────────────────────
+try {
+    safeAttach('IsDebuggerPresent', findExp('kernel32.dll', 'IsDebuggerPresent'), {
+        onLeave: function(retval) {
+            if (retval.toUInt32() !== 0) {
+                log('AntiDebug', 'IsDebuggerPresent → 0');
+                retval.replace(ptr(0));
+            }
+        }
+    });
 
-// MessageBoxA/W — 오류 메시지 표시 차단
-['MessageBoxA', 'MessageBoxW', 'MessageBoxExA', 'MessageBoxExW'].forEach(api => {
-    const fn = Module.findExportByName('user32.dll', api);
-    if (!fn) return;
-    const isWide = api.includes('W');
-    Interceptor.replace(fn, new NativeCallback(function(hWnd, lpText, lpCaption, uType) {
-        try {
-            const text = lpText && !ptr(lpText).isNull()
-                ? (isWide ? ptr(lpText).readUtf16String() : ptr(lpText).readAnsiString())
-                : '';
-            const cap  = lpCaption && !ptr(lpCaption).isNull()
-                ? (isWide ? ptr(lpCaption).readUtf16String() : ptr(lpCaption).readAnsiString())
-                : '';
-            log('MsgBlock', `${api} 차단 — [${cap}] ${text}`);
-        } catch (_) {}
-        return 1;  // IDOK — 다이얼로그 없이 즉시 확인 반환
-    }, 'int', ['pointer', 'pointer', 'pointer', 'uint']));
-});
+    safeAttach('CheckRemoteDebuggerPresent',
+        findExp('kernel32.dll', 'CheckRemoteDebuggerPresent'), {
+        onEnter: function(args) { this._pb = args[1]; },
+        onLeave: function(retval) {
+            try {
+                if (this._pb && !this._pb.isNull()) { Memory.writeU32(this._pb, 0); }
+            } catch (_) {}
+            retval.replace(ptr(1));
+        }
+    });
 
-// TaskDialog / TaskDialogIndirect — 현대 오류 다이얼로그
-const TaskDialog = Module.findExportByName('comctl32.dll', 'TaskDialog');
-if (TaskDialog) {
-    Interceptor.replace(TaskDialog, new NativeCallback(
-        function(hwnd, hInst, title, content, btn) {
-            log('MsgBlock', 'TaskDialog 차단');
-            return 0;  // S_OK
-        }, 'int', ['pointer', 'pointer', 'pointer', 'pointer', 'uint']
-    ));
-}
+    safeAttach('NtQueryInformationProcess',
+        findExp('ntdll.dll', 'NtQueryInformationProcess'), {
+        onEnter: function(args) {
+            this._class  = args[1].toUInt32();
+            this._pInfo  = args[2];
+            this._infoSz = args[3].toUInt32();
+        },
+        onLeave: function(retval) {
+            var DBG_CLASSES = [7, 30, 31];  // DebugPort, DebugObject, DebugFlags
+            var hit = false;
+            for (var i = 0; i < DBG_CLASSES.length; i++) {
+                if (this._class === DBG_CLASSES[i]) { hit = true; break; }
+            }
+            if (hit) {
+                try {
+                    if (this._pInfo && !this._pInfo.isNull() && this._infoSz >= 4) {
+                        Memory.writeU32(this._pInfo, 0);
+                    }
+                } catch (_) {}
+                log('AntiDebug', 'NtQueryInformationProcess(class=' + this._class + ') → 0');
+            }
+        }
+    });
 
-// ExitProcess — 프로세스 강제 종료 차단
-const ExitProcess = Module.findExportByName('kernel32.dll', 'ExitProcess');
-if (ExitProcess) {
-    Interceptor.replace(ExitProcess, new NativeCallback(function(exitCode) {
-        log('AntiKill', `ExitProcess(${exitCode}) 차단 — 프로세스 계속 실행`);
-        // 실제로 종료하지 않음
-    }, 'void', ['uint']));
-}
-
-// TerminateProcess — 타 프로세스 종료 시도도 차단 (자기 자신 대상만)
-const TerminateProcess = Module.findExportByName('kernel32.dll', 'TerminateProcess');
-if (TerminateProcess) {
-    Interceptor.attach(TerminateProcess, {
-        onEnter(args) {
-            // GetCurrentProcess() = 0xFFFFFFFF (-1) = 자기 자신
-            const handle = args[0].toUInt32();
-            if (handle === 0xFFFFFFFF || handle === Process.id) {
-                log('AntiKill', `TerminateProcess(self, ${args[1].toUInt32()}) 차단`);
-                this._blockSelf = true;
+    safeAttach('NtSetInformationThread',
+        findExp('ntdll.dll', 'NtSetInformationThread'), {
+        onEnter: function(args) {
+            if (args[1].toUInt32() === 17) {  // ThreadHideFromDebugger
+                log('AntiDebug', 'NtSetInformationThread(HideFromDebugger) 무력화');
+                this._nop = true;
             }
         },
-        onLeave(retval) {
-            if (this._blockSelf) retval.replace(ptr(1));  // TRUE (성공인 척)
+        onLeave: function(retval) {
+            if (this._nop) { retval.replace(ptr(0)); }
         }
     });
-}
 
-// ─────────────────────────────────────────────────────────────────
-// 자체 무결성 검사 모니터링 (CryptHash / BCryptHash)
-// 패치한 바이너리가 해시 불일치를 일으키는지 탐지 목적
-// ─────────────────────────────────────────────────────────────────
-['CryptHashData', 'CryptGetHashParam'].forEach(api => {
-    const fn = Module.findExportByName('advapi32.dll', api);
-    if (!fn) return;
-    Interceptor.attach(fn, {
-        onEnter(args) {
-            if (api === 'CryptHashData') {
-                log('Integrity', `CryptHashData: ${args[2].toUInt32()} bytes 해싱`);
-            } else {
-                log('Integrity', `CryptGetHashParam: param=${args[1].toUInt32()}`);
+    var DBG_WINDOWS = ['ollydbg', 'x64dbg', 'x32dbg', 'immunity debugger', 'windbg'];
+    ['FindWindowA', 'FindWindowW'].forEach(function(api) {
+        var fn = findExp('user32.dll', api);
+        if (!fn) { return; }
+        var isWide = api.charAt(api.length - 1) === 'W';
+        safeAttach(api, fn, {
+            onEnter: function(args) {
+                try {
+                    var cls  = isWide ? args[0].readUtf16String() : args[0].readAnsiString();
+                    var name = isWide ? args[1].readUtf16String() : args[1].readAnsiString();
+                    var combined = ((cls || '') + (name || '')).toLowerCase();
+                    for (var i = 0; i < DBG_WINDOWS.length; i++) {
+                        if (combined.indexOf(DBG_WINDOWS[i]) !== -1) {
+                            log('AntiDebug', api + ' 디버거 윈도우 → NULL');
+                            this._block = true;
+                            break;
+                        }
+                    }
+                } catch (_) {}
+            },
+            onLeave: function(retval) {
+                if (this._block) { retval.replace(ptr(0)); }
             }
-        }
+        });
     });
-});
 
-const BCryptHashData = Module.findExportByName('bcrypt.dll', 'BCryptHashData');
-if (BCryptHashData) {
-    Interceptor.attach(BCryptHashData, {
-        onEnter(args) {
-            log('Integrity', `BCryptHashData: ${args[2].toUInt32()} bytes 해싱`);
-        }
+    ['OutputDebugStringA', 'OutputDebugStringW'].forEach(function(api) {
+        var fn = findExp('kernel32.dll', api);
+        if (!fn) { return; }
+        safeAttach(api, fn, {
+            onEnter: function(_args) { log('AntiDebug', api + ' 감지'); }
+        });
     });
-}
+} catch (e) { log('ERR', 'AntiDebug 섹션: ' + e.message); }
 
 // ─────────────────────────────────────────────────────────────────
-// GetProcAddress 모니터링 — 동적 API 로딩 탐지
+// QueryPerformanceCounter
 // ─────────────────────────────────────────────────────────────────
-const _GP_WATCH = [
-    'IsDebuggerPresent', 'CheckRemoteDebuggerPresent',
-    'NtQueryInformationProcess', 'MessageBoxW', 'MessageBoxA',
-    'ExitProcess', 'GetModuleFileNameW',
-];
-const GetProcAddress = Module.findExportByName('kernel32.dll', 'GetProcAddress');
-if (GetProcAddress) {
-    Interceptor.attach(GetProcAddress, {
-        onEnter(args) {
+try {
+    var _qpcCounter = 1000000;
+    safeAttach('QueryPerformanceCounter',
+        findExp('kernel32.dll', 'QueryPerformanceCounter'), {
+        onEnter: function(args) { this._pCount = args[0]; },
+        onLeave: function(retval) {
+            _qpcCounter += 10000;
             try {
-                // 서수(ordinal) 로딩은 args[1]이 정수 — 문자열 읽기 전 확인
-                const ordinal = args[1].toUInt32();
-                if (ordinal < 0x10000) return;
-                const name = args[1].readAnsiString() || '';
-                if (_GP_WATCH.some(w => name.includes(w))) {
-                    log('DynImport', `GetProcAddress("${name}") 동적 로딩 탐지`);
+                if (this._pCount && !this._pCount.isNull()) {
+                    this._pCount.writeS64(_qpcCounter);
                 }
             } catch (_) {}
+            retval.replace(ptr(1));
         }
     });
-}
+} catch (e) { log('ERR', 'QPC 섹션: ' + e.message); }
 
-log('INIT', '샌드박스 회피 무력화 훅 로드 완료 (Joe Sandbox 동등 모드)');
+// ─────────────────────────────────────────────────────────────────
+// 프로세스 목록 — 분석 툴 이름 위장
+// ─────────────────────────────────────────────────────────────────
+try {
+    var ANALYSIS_TOOLS = [
+        'x64dbg', 'x32dbg', 'ollydbg', 'windbg', 'ida64', 'ida.exe',
+        'procmon', 'procexp', 'wireshark', 'fiddler', 'processhacker',
+        'immunitydebugger', 'cheatengine', 'dnspy', 'de4dot', 'pestudio',
+        'hollows_hunter', 'pe-sieve', 'pebear', 'cffexplorer', 'apimonitor',
+        'regshot', 'autoruns',
+    ];
+    var _szExeOff = (Process.pointerSize === 8) ? 44 : 36;
+
+    ['Process32NextW', 'Process32NextA', 'Process32FirstW', 'Process32FirstA'].forEach(function(api) {
+        var fn = findExp('kernel32.dll', api);
+        if (!fn) { return; }
+        var isWide = api.charAt(api.length - 1) === 'W';
+        safeAttach(api, fn, {
+            onEnter: function(args) { this._pEntry = args[1]; },
+            onLeave: function(retval) {
+                if (!retval.toUInt32() || !this._pEntry) { return; }
+                try {
+                    var namePtr = this._pEntry.add(_szExeOff);
+                    var exeName = isWide ? namePtr.readUtf16String() : namePtr.readAnsiString();
+                    if (!exeName) { return; }
+                    var lower = exeName.toLowerCase();
+                    for (var i = 0; i < ANALYSIS_TOOLS.length; i++) {
+                        if (lower.indexOf(ANALYSIS_TOOLS[i]) !== -1) {
+                            log('ProcHide', api + ': "' + exeName + '" → explorer.exe');
+                            if (isWide) { namePtr.writeUtf16String('explorer.exe'); }
+                            else        { namePtr.writeAnsiString('explorer.exe'); }
+                            this._pEntry.add(8).writeU32(4);
+                            break;
+                        }
+                    }
+                } catch (_) {}
+            }
+        });
+    });
+} catch (e) { log('ERR', 'ProcHide 섹션: ' + e.message); }
+
+// ─────────────────────────────────────────────────────────────────
+// MessageBox 차단 (NativeCallback — 가장 중요한 훅)
+// ─────────────────────────────────────────────────────────────────
+log('INIT', 'MessageBox 훅 시작 (WIN_ABI=' + WIN_ABI + ')');
+try {
+    function hookMessageBox(api) {
+        var fn = findExp('user32.dll', api);
+        if (!fn) { log('HOOK', api + ' 미발견'); return; }
+        var isWide = api.indexOf('W') !== -1;
+        var cb = safeCb(api,
+            'int',
+            ['pointer', 'pointer', 'pointer', 'uint'],
+            function(hWnd, lpText, lpCaption, uType) {
+                try {
+                    var readStr = function(p) {
+                        if (!p || p.isNull()) { return ''; }
+                        return isWide ? p.readUtf16String() : p.readAnsiString();
+                    };
+                    log('MsgBlock', api + ' 차단: [' + readStr(lpCaption) + '] ' + readStr(lpText));
+                } catch (_) {}
+                return 1;  // IDOK
+            }
+        );
+        safeReplace(api, fn, cb);
+    }
+    hookMessageBox('MessageBoxA');
+    hookMessageBox('MessageBoxW');
+} catch (e) { log('ERR', 'MessageBox 섹션: ' + e.message); }
+
+// MessageBoxEx — wLanguageId 파라미터 추가
+try {
+    function hookMessageBoxEx(api) {
+        var fn = findExp('user32.dll', api);
+        if (!fn) { return; }
+        var isWide = api.indexOf('W') !== -1;
+        var cb = safeCb(api,
+            'int',
+            ['pointer', 'pointer', 'pointer', 'uint', 'uint'],
+            function(hWnd, lpText, lpCaption, uType, wLangId) {
+                try {
+                    var readStr = function(p) {
+                        if (!p || p.isNull()) { return ''; }
+                        return isWide ? p.readUtf16String() : p.readAnsiString();
+                    };
+                    log('MsgBlock', api + ' 차단: ' + readStr(lpText));
+                } catch (_) {}
+                return 1;
+            }
+        );
+        safeReplace(api, fn, cb);
+    }
+    hookMessageBoxEx('MessageBoxExA');
+    hookMessageBoxEx('MessageBoxExW');
+} catch (e) { log('ERR', 'MessageBoxEx 섹션: ' + e.message); }
+
+// ─────────────────────────────────────────────────────────────────
+// 프로세스 강제 종료 방지 — NtTerminateProcess
+// ─────────────────────────────────────────────────────────────────
+log('INIT', 'ExitProcess 훅 시작');
+try {
+    var ntTermAddr = findExp('ntdll.dll', 'NtTerminateProcess');
+    var ntTermCb = safeCb('NtTerminateProcess',
+        'int',
+        ['pointer', 'uint'],
+        function(hProcess, exitStatus) {
+            var h = hProcess.toInt32();
+            if (h === -1 || h === 0) {
+                log('AntiKill', 'NtTerminateProcess(self, ' + exitStatus + ') 차단');
+                return 0;
+            }
+            return 0;
+        }
+    );
+    safeReplace('NtTerminateProcess', ntTermAddr, ntTermCb);
+} catch (e) { log('ERR', 'NtTerminate 섹션: ' + e.message); }
+
+// ─────────────────────────────────────────────────────────────────
+// 무결성 해싱 모니터링
+// ─────────────────────────────────────────────────────────────────
+try {
+    safeAttach('CryptHashData', findExp('advapi32.dll', 'CryptHashData'), {
+        onEnter: function(args) {
+            log('Integrity', 'CryptHashData: ' + args[2].toUInt32() + ' bytes');
+        }
+    });
+    safeAttach('BCryptHashData', findExp('bcrypt.dll', 'BCryptHashData'), {
+        onEnter: function(args) {
+            log('Integrity', 'BCryptHashData: ' + args[2].toUInt32() + ' bytes');
+        }
+    });
+} catch (e) { log('ERR', 'Integrity 섹션: ' + e.message); }
+
+log('INIT', '모든 훅 로드 완료');
