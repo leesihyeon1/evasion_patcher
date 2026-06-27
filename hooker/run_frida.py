@@ -37,6 +37,20 @@ def on_message(message: dict, data) -> None:
         print(f"[frida] {message['payload']}")
     elif message["type"] == "error":
         print(f"[frida ERROR] {message['description']}", file=sys.stderr)
+        stack = message.get("stack", "")
+        if stack:
+            print(f"[frida STACK]\n{stack}", file=sys.stderr)
+
+
+def _make_script(session, script_src: str):
+    script = session.create_script(script_src)
+    script.on("message", on_message)
+    try:
+        script.load()
+    except frida.InvalidOperationError as e:
+        print(f"[!] 스크립트 로드 실패: {e}", file=sys.stderr)
+        raise
+    return script
 
 
 def attach_spawn(target_path: str, script_src: str) -> None:
@@ -46,9 +60,7 @@ def attach_spawn(target_path: str, script_src: str) -> None:
     print(f"[*] 스폰됨: {target_path} (PID={pid})")
 
     session = device.attach(pid)
-    script = session.create_script(script_src)
-    script.on("message", on_message)
-    script.load()
+    _make_script(session, script_src)
     print("[*] 훅 로드 완료 — 프로세스 재개")
     device.resume(pid)
     _wait(session)
@@ -58,9 +70,7 @@ def attach_pid(pid: int, script_src: str) -> None:
     """실행 중인 PID에 훅 주입"""
     session = frida.attach(pid)
     print(f"[*] PID {pid} 에 붙었습니다")
-    script = session.create_script(script_src)
-    script.on("message", on_message)
-    script.load()
+    _make_script(session, script_src)
     print("[*] 훅 로드 완료")
     _wait(session)
 
@@ -69,21 +79,34 @@ def attach_name(name: str, script_src: str) -> None:
     """프로세스 이름으로 훅 주입"""
     session = frida.attach(name)
     print(f"[*] '{name}' 에 붙었습니다")
-    script = session.create_script(script_src)
-    script.on("message", on_message)
-    script.load()
+    _make_script(session, script_src)
     print("[*] 훅 로드 완료")
     _wait(session)
 
 
 def _wait(session) -> None:
-    print("[*] Ctrl+C 를 눌러 종료")
+    import threading
+    done = threading.Event()
+
+    def on_detached(reason, crash):
+        if crash:
+            print(f"\n[!] 프로세스 크래시: {crash.report}", file=sys.stderr)
+        print(f"[!] 세션 분리 — 이유: {reason}")
+        done.set()
+
+    session.on("detached", on_detached)
+    print("[*] 실행 중 — Ctrl+C 로 종료")
     try:
-        input()
+        done.wait(timeout=600)
+        if not done.is_set():
+            print("[!] 타임아웃 (10분)")
     except KeyboardInterrupt:
-        pass
+        print("\n[*] 중단 요청")
     finally:
-        session.detach()
+        try:
+            session.detach()
+        except Exception:
+            pass
         print("[*] 세션 종료")
 
 

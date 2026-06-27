@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import struct
 
+from capstone.x86 import X86_OP_IMM, X86_OP_REG, X86_REG_EAX
+
 from core.disasm import (
     find_call_sites,
     find_next_cond_jump,
@@ -33,6 +35,31 @@ from .base import BaseDetector, Finding, PatchAction
 _SLEEP_THRESHOLD_MS = 5_000
 
 _RDTSC  = b"\x0f\x31"
+
+
+def _rdtsc_is_timing_check(cs, pe_data: bytearray, file_off: int, va: int) -> bool:
+    """
+    RDTSC 이후 64B 내에 타이밍 체크 패턴이 있는지 확인.
+    - sub eax, [mem] / sub eax, reg  → 타이밍 델타 계산
+    - cmp eax, imm  (eax 비교)       → 임계값 비교
+    - ja / jg / jb / jl              → 타이밍 기반 분기
+    → 하나라도 있으면 타이밍 체크로 판단.
+    """
+    fwd_chunk = bytes(pe_data[file_off + 2: file_off + 2 + 80])
+    for insn in cs.disasm(fwd_chunk, va + 2):
+        m = insn.mnemonic.lower()
+        ops = insn.operands
+
+        # sub eax, ... → 타이밍 델타 계산
+        if m == "sub" and ops and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_EAX:
+            return True
+        # cmp eax, imm → 임계값 비교
+        if m == "cmp" and ops and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_EAX:
+            return True
+        # 무조건 점프는 여기서 끝
+        if m == "jmp" or m in ("ret", "retn", "call"):
+            break
+    return False
 _TIMING_APIS = {
     "kernel32.dll": ["Sleep", "SleepEx", "GetTickCount", "GetTickCount64"],
     "ntdll.dll":    ["NtDelayExecution", "ZwDelayExecution"],
@@ -48,24 +75,38 @@ class SleepDetector(BaseDetector):
         imports = self.pe.get_imports()
 
         # ── 1) RDTSC 패턴 스캔 ──────────────────────────────────
+        _rdtsc_patch = 0
+        _rdtsc_skip  = 0
         for sec_off, sec_rva, sec_va, sec_data in self.pe.get_code_sections():
             for file_off, abs_va in scan_two_byte_pattern(
                 sec_data, sec_off, sec_rva, self.pe.image_base, _RDTSC
             ):
+                is_timing = _rdtsc_is_timing_check(
+                    self.cs, self.pe.data, file_off, abs_va
+                )
+                if is_timing:
+                    _rdtsc_patch += 1
+                else:
+                    _rdtsc_skip += 1
                 orig = self.pe.read_bytes(file_off, 2)
                 findings.append(Finding(
                     category="sleep",
                     technique="RDTSC",
                     va=abs_va,
                     file_offset=file_off,
-                    description=f"RDTSC 타이밍 체크 @ 0x{abs_va:08X}",
+                    description=(
+                        f"RDTSC 타이밍 체크 @ 0x{abs_va:08X}"
+                        if is_timing else
+                        f"RDTSC @ 0x{abs_va:08X} — 타이밍 패턴 없음 (제외)"
+                    ),
                     patch_actions=[PatchAction(
                         file_offset=file_off,
                         original_bytes=orig,
                         new_bytes=b"\x90\x90",
                         description="RDTSC → NOP NOP",
-                    )],
+                    )] if is_timing else [],
                 ))
+        print(f"  [RDTSC 분석] 패치대상={_rdtsc_patch}건 / 제외(비타이밍)={_rdtsc_skip}건")
 
         # ── 2) Sleep / SleepEx — 인자 패치 ──────────────────────
         for dll, apis in _TIMING_APIS.items():
